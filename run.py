@@ -10,7 +10,7 @@ from colorama import Fore, Style, init
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
-from tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool
+from tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
 from agent import CodingAgent
 
 # Initialize colorama
@@ -70,54 +70,110 @@ def find_latest_debug_file(workspace):
 
 
 def parse_debug_file(filepath):
-    """Parse debug file to extract messages and display history
+    """Parse debug file with incremental format to extract messages and display history
+    
+    New format uses:
+    - --- USER --- : User input (first one is text, subsequent are in TOOL_RESULT)
+    - --- ASSISTANT --- : Assistant response (JSON array)
+    - --- TOOL_RESULT --- : Tool execution results
+    - --- END_TURN --- : Marks turn completion
     
     Returns:
-        tuple: (messages, display_history) for resuming conversation
+        tuple: (messages, display_history, incomplete_turn) 
+               incomplete_turn is the pending input to continue from, or None if complete
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
     
     messages = []
     display_history = []
+    incomplete_turn = None
     
     # Split by turn markers
-    turns = re.split(r'\n=== TURN \d+ ===\n', content)
+    turn_splits = re.split(r'\n=== TURN \d+ ===\n', content)
     
-    for turn in turns[1:]:  # Skip header before first turn
-        # Extract user input
-        user_match = re.search(r'--- USER INPUT ---\n(.*?)\n--- API MESSAGES ---', turn, re.DOTALL)
-        if user_match:
-            user_input = user_match.group(1).strip()
-            display_history.append(("user", user_input))
+    for turn_content in turn_splits[1:]:  # Skip header before first turn
+        turn_complete = '--- END_TURN ---' in turn_content
         
-        # Extract API messages
-        api_match = re.search(r'--- API MESSAGES ---\n(.*?)\n--- API RESPONSE ---', turn, re.DOTALL)
-        if api_match:
-            try:
-                messages = json.loads(api_match.group(1).strip())
-            except json.JSONDecodeError:
-                pass  # Keep previous messages if parsing fails
+        # Find all blocks using findall to get ordered list of (type, content)
+        # Match: --- TYPE ---\n followed by content until next --- or === or end
+        block_pattern = r'--- (USER|ASSISTANT|TOOL_RESULT) ---\n(.*?)(?=\n--- |\n=== |$)'
+        block_matches = re.findall(block_pattern, turn_content, re.DOTALL)
         
-        # Extract agent response for display
-        response_match = re.search(r'--- API RESPONSE ---\n(.*?)(?:\n--- TOOL CALLS ---|$)', turn, re.DOTALL)
-        if response_match:
-            try:
-                response_data = json.loads(response_match.group(1).strip())
-                if response_data.get("content"):
-                    agent_text = "\n".join(response_data["content"]) if isinstance(response_data["content"], list) else str(response_data["content"])
-                    display_history.append(("assistant", agent_text))
-            except json.JSONDecodeError:
-                pass
+        last_assistant_content = None
+        last_tool_results = None
+        
+        for block_type, block_data in block_matches:
+            block_data = block_data.strip()
+            
+            if block_type == "USER":
+                # First USER in a turn is the actual user input (plain text)
+                messages.append({"role": "user", "content": block_data})
+                display_history.append(("user", block_data))
+                    
+            elif block_type == "ASSISTANT":
+                try:
+                    assistant_content = json.loads(block_data)
+                    messages.append({"role": "assistant", "content": assistant_content})
+                    last_assistant_content = assistant_content
+                    
+                    # Extract text for display
+                    texts = [b["text"] for b in assistant_content if b.get("type") == "text"]
+                    if texts:
+                        display_history.append(("assistant", "\n".join(texts)))
+                    
+                    # Extract tool descriptions for display
+                    for b in assistant_content:
+                        if b.get("type") == "tool_use":
+                            desc = get_tool_description(b.get("name", ""), b.get("input", {}))
+                            display_history.append(("tool", desc))
+                except json.JSONDecodeError:
+                    pass
+                    
+            elif block_type == "TOOL_RESULT":
+                try:
+                    tool_results = json.loads(block_data)
+                    messages.append({"role": "user", "content": tool_results})
+                    last_tool_results = tool_results
+                except json.JSONDecodeError:
+                    pass
+        
+        # Check if turn is incomplete
+        if not turn_complete:
+            # Determine what to resume with based on last block
+            if last_tool_results is not None:
+                # Crashed after tool execution - messages already has tool_results
+                # Just need to call API to continue generation
+                incomplete_turn = {"type": "continue"}
+            elif last_assistant_content is not None:
+                # Crashed after assistant response with tool_use but before tools ran
+                tool_uses = [b for b in last_assistant_content if b.get("type") == "tool_use"]
+                if tool_uses:
+                    # Need to execute tools, then continue
+                    incomplete_turn = {"type": "execute_tools", "tool_uses": tool_uses}
     
-    # Also check for compaction events and update messages
-    compaction_match = re.search(r'=== COMPACTION EVENT ===.*?Summary content:\n(.*?)(?:\n===|$)', content, re.DOTALL)
-    if compaction_match:
-        # If there was a compaction, the messages array should reflect the summarized state
-        # The last API MESSAGES block should have this
-        pass  # Messages already extracted from last turn
+    return messages, display_history, incomplete_turn
+
+
+def parse_container_info(filepath):
+    """Parse container info from debug file
     
-    return messages, display_history
+    Returns:
+        dict: Container info with container_name and working_dirs, or None if not found
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Find the last CONTAINER INFO block
+    matches = list(re.finditer(r'=== CONTAINER INFO ===\n(.*?)(?=\n===|$)', content, re.DOTALL))
+    
+    if matches:
+        try:
+            return json.loads(matches[-1].group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    
+    return None
 
 
 def replay_display_history(display_history):
@@ -127,6 +183,8 @@ def replay_display_history(display_history):
             print(f"{Fore.CYAN}You:{Style.RESET_ALL} {content}")
         elif role == "assistant":
             print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {content}")
+        elif role == "tool":
+            print(f"{Fore.YELLOW}{content}{Style.RESET_ALL}")
     print()
 
 
@@ -160,6 +218,8 @@ def main():
     initial_messages = None
     display_history = None
     resume_file = None
+    container_info = None
+    incomplete_turn = None
     
     if args.resume:
         if args.resume == 'LATEST':
@@ -174,7 +234,8 @@ def main():
                 return
         
         print(f"{Fore.CYAN}Resuming from: {resume_file}")
-        initial_messages, display_history = parse_debug_file(resume_file)
+        initial_messages, display_history, incomplete_turn = parse_debug_file(resume_file)
+        container_info = parse_container_info(resume_file)
         
         if display_history:
             print(f"{Fore.CYAN}--- Previous conversation ---{Style.RESET_ALL}\n")
@@ -182,19 +243,26 @@ def main():
             print(f"{Fore.CYAN}--- Resuming conversation ---{Style.RESET_ALL}\n")
         else:
             print(f"{Fore.YELLOW}No conversation history found in debug file")
+        
+        if incomplete_turn:
+            print(f"{Fore.YELLOW}⚠️  Detected incomplete turn - will continue from crash point{Style.RESET_ALL}")
 
     # Initialize tools
     terminal = TerminalTool(workspace)
     web_search = WebSearchTool()
     fetch_web = FetchWebTool()
-    docker_sandbox = DockerSandboxTool()
+    docker_sandbox = DockerSandboxTool()  # Agent ref will be set after agent creation
 
     # Create agent (pass debug_file if resuming to append to same file)
     agent = CodingAgent(
         tools=[terminal, web_search, fetch_web, docker_sandbox],
         workspace_dir=workspace,
-        debug_file=resume_file  # None for new session, path for resume
+        debug_file=resume_file,  # None for new session, path for resume
+        container_info=container_info  # None for new session, dict for resume
     )
+    
+    # Wire up DockerSandboxTool with agent reference
+    docker_sandbox.set_agent_ref(agent)
     
     # If resuming, initialize agent with previous state
     if initial_messages:
@@ -212,35 +280,52 @@ def main():
     if not args.resume:
         print(f"{Fore.GREEN}Coding Agent initialized in: {workspace}")
     print(f"{Fore.CYAN}Debug logs: {agent.debug_file}")
+    print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
     print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Type 'exit' to quit\n")
 
-    while True:
+    # If resuming with incomplete turn, continue it first
+    if incomplete_turn:
         try:
-            user_input = prompt(
-                [('class:prompt', 'You: ')],
-                style=prompt_style,
-                key_bindings=bindings,
-                multiline=True,
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n{Fore.GREEN}Goodbye!")
-            break
-
-        if user_input.lower() == 'exit':
-            print(f"{Fore.GREEN}Goodbye!")
-            break
-
-        if not user_input:
-            continue
-
-        try:
-            agent.run(user_input)
-        except KeyboardInterrupt:
-            print(f"\n{Fore.YELLOW}Interrupted by user")
+            print(f"{Fore.YELLOW}Continuing interrupted turn...{Style.RESET_ALL}")
+            agent.continue_incomplete_turn(incomplete_turn)
         except Exception as e:
-            print(f"{Fore.RED}Error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"{Fore.RED}Error continuing turn: {e}{Style.RESET_ALL}")
+
+    try:
+        while True:
+            try:
+                user_input = prompt(
+                    [('class:prompt', 'You: ')],
+                    style=prompt_style,
+                    key_bindings=bindings,
+                    multiline=True,
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{Fore.GREEN}Goodbye!")
+                break
+
+            if user_input.lower() == 'exit':
+                print(f"{Fore.GREEN}Goodbye!")
+                break
+
+            if not user_input:
+                continue
+
+            try:
+                agent.run(user_input)
+            except KeyboardInterrupt:
+                print(f"\n{Fore.YELLOW}Interrupted by user")
+            except Exception as e:
+                print(f"{Fore.RED}Error: {e}")
+                import traceback
+                traceback.print_exc()
+    finally:
+        # Cleanup: check if session was empty
+        if agent.cleanup_empty_session():
+            pass  # Cleanup message already printed
+        else:
+            # Stop container gracefully
+            agent.stop_container()
 
 if __name__ == "__main__":
     main()

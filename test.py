@@ -35,15 +35,17 @@ schema = fetch_web.get_schema()
 assert schema["name"] == "fetch_webpage"
 print("✓ FetchWebTool schema valid")
 
-print("\nTesting command allowlist...")
-# Test allowlist enforcement
-result = terminal.execute("ls")
-assert "error" not in result or "allowlist" not in result["error"]
-print("✓ Allowed command works")
+print("\nTesting command denylist...")
+# Test denylist - safe commands should work
+result = terminal.execute("echo hello")
+assert "error" not in result or "rejected" not in result.get("error", "").lower()
+print("✓ Safe command works")
 
-result = terminal.execute("malicious_command")
-assert "error" in result and "allowlist" in result["error"]
-print("✓ Disallowed command blocked")
+# Test that dangerous commands trigger confirmation (we're not testing the actual block here
+# because that requires user interaction). Just verify the tool is initialized.
+assert hasattr(terminal, 'DANGEROUS_COMMANDS')
+assert 'rm' in terminal.DANGEROUS_COMMANDS
+print("✓ Denylist configured correctly")
 
 print("\n" + "="*50)
 print("All basic tests passed! ✓")

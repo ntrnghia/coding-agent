@@ -8,11 +8,14 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Web search**: Search using DuckDuckGo (ddgs package)
 - **Web fetching**: Fetch and read webpage content
 - **Docker sandbox**: Safely explore external directories in isolated containers
+- **Persistent container**: Single container per session with multiple mount support
 - **Command denylist**: Dangerous commands require user confirmation
 - **Colored output**: Easy-to-read console with color-coded messages
-- **Debug logging**: Full JSON logs saved to `debug/` folder
+- **Debug logging**: Incremental logging to `debug/` folder (crash-resilient)
 - **Resume sessions**: Continue previous conversations with `-r` flag
+- **Mid-turn resume**: Automatically recovers from crashes mid-tool-execution
 - **Auto-compact**: Automatically summarizes context when approaching token limit
+- **Auto-cleanup**: Empty conversations (no interaction) are automatically deleted
 
 ## Setup
 
@@ -86,9 +89,11 @@ Fetches and extracts text content from URLs.
 
 ### Docker Sandbox Tool
 Safely explore external directories in isolated Docker containers:
-- Mounts directories at `/workspace` with read-write access
-- Containers persist across prompts (no restart needed)
-- Multiple directories can be mounted simultaneously
+- **Single persistent container** per session (named `agent_<timestamp>`)
+- Directories mounted at Unix-style paths: `D:\Downloads\project` → `/d/downloads/project`
+- Read-write access to all mounted directories
+- Multiple directories can be mounted dynamically
+- Container persists across prompts and survives resume
 - Uses `python:slim` image by default
 
 ## Context Management
@@ -109,7 +114,7 @@ Summary content: [condensed conversation]
 
 ## Resume Sessions
 
-Sessions are logged to `debug/debug_<timestamp>.txt`. To resume:
+Sessions are logged incrementally to `debug/debug_<timestamp>.txt`. To resume:
 
 ```bash
 # Resume most recent session
@@ -120,9 +125,27 @@ python run.py -r debug/debug_20251210_120000.txt
 ```
 
 On resume:
-- Previous conversation is displayed
+- Previous conversation is displayed (including tool operations)
 - Context is restored (including any compacted summaries)
+- Container state is restored (mounts preserved)
 - New messages append to the same debug file
+- **Crash recovery**: If the agent crashed mid-turn, it will automatically continue from where it left off
+
+## Debug Log Format
+
+Debug files use an incremental format for crash resilience:
+```
+=== TURN 1 ===
+--- USER ---
+<user message>
+--- ASSISTANT ---
+<JSON response>
+--- TOOL_RESULT ---
+<JSON tool results>
+--- END_TURN ---
+```
+
+Each block is written immediately, so even if the agent crashes, the debug file contains all completed operations.
 
 ## Output Format
 

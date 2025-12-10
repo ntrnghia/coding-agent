@@ -1,8 +1,110 @@
 import subprocess
 import os
+import re
 from ddgs import DDGS
 import requests
 from bs4 import BeautifulSoup
+
+
+def get_tool_description(tool_name, tool_input):
+    """Convert tool call to human-readable description for display"""
+    if tool_name == "docker_sandbox":
+        action = tool_input.get("action", "")
+        if action == "start":
+            path = tool_input.get("mount_path", "")
+            return f"🐳 Start container: {path}"
+        elif action == "exec":
+            cmd = tool_input.get("command", "")
+            return _parse_exec_command(cmd)
+        elif action == "stop":
+            path = tool_input.get("mount_path", "")
+            if path:
+                return f"🐳 Stop container: {path}"
+            return "🐳 Stop all containers"
+        return f"🐳 Docker: {action}"
+    
+    elif tool_name == "execute_command":
+        cmd = tool_input.get("command", "")
+        display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
+        return f"⚡ Run: {display_cmd}"
+    
+    elif tool_name == "web_search":
+        query = tool_input.get("query", "")
+        return f"🔍 Search: {query}"
+    
+    elif tool_name == "fetch_webpage":
+        url = tool_input.get("url", "")
+        display_url = url[:50] + "..." if len(url) > 50 else url
+        return f"🌐 Fetch: {display_url}"
+    
+    return f"🔧 {tool_name}"
+
+
+def _parse_exec_command(cmd):
+    """Parse exec command into human-readable description"""
+    # Handle piped commands: split by | and analyze
+    parts = [p.strip() for p in cmd.split('|')]
+    main_cmd = parts[0]
+    
+    # Check for line limiting in pipe (head/tail)
+    line_info = ""
+    for part in parts[1:]:
+        head_match = re.match(r'head\s+(?:-n\s*)?(\d+)', part)
+        tail_match = re.match(r'tail\s+(?:-n\s*)?(\d+)', part)
+        if head_match:
+            line_info = f" (first {head_match.group(1)} lines)"
+        elif tail_match:
+            line_info = f" (last {tail_match.group(1)} lines)"
+    
+    # Parse main command
+    if main_cmd.startswith("ls"):
+        return "📂 List files"
+    
+    elif main_cmd.startswith("cat "):
+        match = re.search(r'cat\s+([^|]+)', main_cmd)
+        if match:
+            filepath = match.group(1).strip()
+            filename = filepath.split('/')[-1]
+            return f"📄 Read {filename}{line_info}"
+        return f"📄 Read file{line_info}"
+    
+    elif main_cmd.startswith("head "):
+        match = re.match(r'head\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
+        if match:
+            num = match.group(1)
+            filepath = match.group(2)
+            if filepath:
+                filename = filepath.strip().split('/')[-1]
+                if num:
+                    return f"📄 Read {filename} (first {num.lstrip('-')} lines)"
+                return f"📄 Read {filename}"
+        return "📄 Read file"
+    
+    elif main_cmd.startswith("tail "):
+        match = re.match(r'tail\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
+        if match:
+            num = match.group(1)
+            filepath = match.group(2)
+            if filepath:
+                filename = filepath.strip().split('/')[-1]
+                if num:
+                    return f"📄 Read {filename} (last {num.lstrip('-')} lines)"
+                return f"📄 Read {filename}"
+        return "📄 Read file"
+    
+    elif main_cmd.startswith("find "):
+        return "🔎 Find files"
+    
+    elif main_cmd.startswith("grep "):
+        return "🔎 Search in files"
+    
+    elif main_cmd.startswith("wc "):
+        return "📊 Count lines/words"
+    
+    else:
+        display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
+        return f"⚡ Run: {display_cmd}"
+
 
 class TerminalTool:
     """Execute shell commands in workspace"""
@@ -163,14 +265,18 @@ class FetchWebTool:
 
 
 class DockerSandboxTool:
-    """Execute commands in a Docker sandbox for safe exploration of external directories"""
+    """Execute commands in a Docker sandbox for safe exploration of external directories.
+    
+    Uses the agent's ContainerManager for persistent container with multiple mounts.
+    """
 
-    DEFAULT_IMAGE = "python:slim"
-
-    def __init__(self, confirm_callback=None):
-        self.containers = {}  # {mount_path: container_id}
-        self.active_path = None  # Track last-used container
+    def __init__(self, agent_ref=None, confirm_callback=None):
+        self.agent_ref = agent_ref  # Reference to CodingAgent for container management
         self.confirm_callback = confirm_callback or self._default_confirm
+
+    def set_agent_ref(self, agent):
+        """Set agent reference after initialization"""
+        self.agent_ref = agent
 
     def _default_confirm(self, message):
         """Default confirmation prompt"""
@@ -183,20 +289,18 @@ class DockerSandboxTool:
             "name": "docker_sandbox",
             "description": """Execute commands in a Docker sandbox. Use this for safely exploring external directories or running untrusted code.
 
-Containers persist across prompts - only stop when completely done with a directory.
-Multiple directories can be mounted in separate containers simultaneously.
+A single container persists for the entire session. All directories are mounted in the same container.
             
 Actions:
-- 'start': Start a container with a directory mounted at /workspace. If already running for that path, reuses it.
-- 'exec': Execute a command inside the active container.
-- 'stop': Stop container(s). Optionally specify mount_path to stop specific one, otherwise stops all.
+- 'start': Mount a directory and start container if not running. Path is converted to Unix format (D:\\path → /d/path).
+- 'exec': Execute a command inside the container.
+- 'stop': Stop the container.
 
 Examples:
-- Start: {"action": "start", "mount_path": "D:\\\\Downloads\\\\some-project"}
-- Execute: {"action": "exec", "command": "ls -la /workspace"}
-- Execute: {"action": "exec", "command": "cat /workspace/main.py"}
-- Stop specific: {"action": "stop", "mount_path": "D:\\\\Downloads\\\\some-project"}
-- Stop all: {"action": "stop"}""",
+- Start: {"action": "start", "mount_path": "D:\\\\Downloads\\\\project"}  → mounted at /d/downloads/project
+- Execute: {"action": "exec", "command": "ls -la /d/downloads/project"}
+- Execute: {"action": "exec", "command": "cat /d/downloads/project/main.py"}
+- Stop: {"action": "stop"}""",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -207,165 +311,74 @@ Examples:
                     },
                     "mount_path": {
                         "type": "string",
-                        "description": "Path to mount into container (required for 'start', optional for 'stop' to stop specific container)"
+                        "description": "Path to mount into container (required for 'start')"
                     },
                     "command": {
                         "type": "string",
                         "description": "Command to execute in container (required for 'exec' action)"
-                    },
-                    "image": {
-                        "type": "string",
-                        "description": "Docker image to use (default: python:slim)"
                     }
                 },
                 "required": ["action"]
             }
         }
 
-    def execute(self, action, mount_path=None, command=None, image=None):
+    def execute(self, action, mount_path=None, command=None, **kwargs):
         """Execute docker sandbox action"""
-        image = image or self.DEFAULT_IMAGE
+        if not self.agent_ref:
+            return {"error": "DockerSandboxTool not initialized with agent reference"}
 
         if action == "start":
-            return self._start_container(mount_path, image)
+            return self._start_or_add_mount(mount_path)
         elif action == "exec":
             return self._exec_command(command)
         elif action == "stop":
-            return self._stop_container(mount_path)
+            return self._stop_container()
         else:
             return {"error": f"Unknown action: {action}"}
 
-    def _start_container(self, mount_path, image):
-        """Start a new Docker container with mounted directory"""
+    def _start_or_add_mount(self, mount_path):
+        """Start container or add new mount"""
         if not mount_path:
             return {"error": "mount_path is required for 'start' action"}
 
-        # Normalize path for comparison
-        norm_path = os.path.normpath(mount_path)
+        # Use agent's add_working_directory method
+        result = self.agent_ref.add_working_directory(mount_path)
         
-        # Check if container already exists for this path
-        if norm_path in self.containers:
-            self.active_path = norm_path
+        if result.get("status") == "already_mounted":
             return {
-                "status": "Container already running",
-                "container_id": self.containers[norm_path],
-                "mounted_path": mount_path,
-                "workspace": "/workspace",
-                "image": image
+                "status": "Already mounted",
+                "mount_path": result["mount_path"],
+                "container": self.agent_ref.container_manager.container_name
             }
-
-        # Convert Windows path to Docker-compatible format
-        docker_path = mount_path.replace('\\', '/')
-        if len(docker_path) > 1 and docker_path[1] == ':':
-            # Convert D:\path to /d/path for Docker on Windows
-            docker_path = '/' + docker_path[0].lower() + docker_path[2:]
-
-        try:
-            # Pull image if needed
-            subprocess.run(
-                ["docker", "pull", image],
-                capture_output=True,
-                text=True
-            )
-
-            # Start container with mount
-            result = subprocess.run(
-                [
-                    "docker", "run", "-d", "--rm",
-                    "-v", f"{docker_path}:/workspace",
-                    "-w", "/workspace",
-                    image,
-                    "tail", "-f", "/dev/null"  # Keep container running
-                ],
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                return {"error": f"Failed to start container: {result.stderr}"}
-
-            container_id = result.stdout.strip()[:12]
-            self.containers[norm_path] = container_id
-            self.active_path = norm_path
-
+        elif result.get("error"):
+            return {"error": result["error"]}
+        else:
             return {
-                "status": "Container started",
-                "container_id": container_id,
-                "mounted_path": mount_path,
-                "workspace": "/workspace",
-                "image": image,
-                "tip": "Use action='exec' with command to run commands. The mounted directory is read-only at /workspace."
+                "status": result.get("status", "ready"),
+                "mount_path": result["mount_path"],
+                "container": self.agent_ref.container_manager.container_name,
+                "all_mounts": self.agent_ref.container_manager.get_mount_info()
             }
-
-        except FileNotFoundError:
-            return {"error": "Docker is not installed or not in PATH"}
-        except Exception as e:
-            return {"error": str(e)}
 
     def _exec_command(self, command):
-        """Execute command in active container"""
-        if not self.active_path or self.active_path not in self.containers:
-            return {"error": "No container running. Use action='start' first."}
-
+        """Execute command in container"""
         if not command:
             return {"error": "command is required for 'exec' action"}
 
-        container_id = self.containers[self.active_path]
+        cm = self.agent_ref.container_manager
+        
+        if not cm.container_running():
+            if not cm.working_dirs:
+                return {"error": "No directories mounted. Use action='start' first."}
+            # Start container if not running
+            result = cm.start()
+            if result.get("error"):
+                return {"error": result["error"]}
 
-        try:
-            result = subprocess.run(
-                ["docker", "exec", container_id, "sh", "-c", command],
-                capture_output=True,
-                text=True
-            )
+        return cm.exec(command)
 
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _stop_container(self, mount_path=None):
-        """Stop container(s). If mount_path specified, stop only that one. Otherwise stop all."""
-        if mount_path:
-            # Stop specific container
-            norm_path = os.path.normpath(mount_path)
-            if norm_path not in self.containers:
-                return {"status": "No container running for that path"}
-
-            container_id = self.containers[norm_path]
-            try:
-                subprocess.run(
-                    ["docker", "stop", container_id],
-                    capture_output=True,
-                    text=True
-                )
-                del self.containers[norm_path]
-                if self.active_path == norm_path:
-                    self.active_path = next(iter(self.containers), None)
-                return {"status": "Container stopped", "container_id": container_id, "path": mount_path}
-            except Exception as e:
-                return {"error": str(e)}
-        else:
-            # Stop all containers
-            if not self.containers:
-                return {"status": "No containers running"}
-
-            stopped = []
-            for path, container_id in list(self.containers.items()):
-                try:
-                    subprocess.run(
-                        ["docker", "stop", container_id],
-                        capture_output=True,
-                        text=True
-                    )
-                    stopped.append({"container_id": container_id, "path": path})
-                except Exception:
-                    pass
-            
-            self.containers.clear()
-            self.active_path = None
-            return {"status": "All containers stopped", "stopped": stopped}
+    def _stop_container(self):
+        """Stop the container"""
+        cm = self.agent_ref.container_manager
+        result = cm.stop()
+        return {"status": "stopped", "container": cm.container_name}

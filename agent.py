@@ -2,11 +2,194 @@ import anthropic
 import json
 import os
 import re
+import subprocess
 from datetime import datetime
 from colorama import Fore, Style, init
+from tools import get_tool_description
 
 # Initialize colorama
 init(autoreset=True)
+
+
+class ContainerManager:
+    """Manages a persistent Docker container for the agent session"""
+    
+    DEFAULT_IMAGE = "python:slim"
+    
+    def __init__(self, container_name, working_dirs=None):
+        self.container_name = container_name
+        self.working_dirs = working_dirs or []
+        self.image = self.DEFAULT_IMAGE
+    
+    @staticmethod
+    def windows_to_mount_path(win_path):
+        """Convert Windows path to container mount path
+        D:\\Downloads\\coding_agent → /d/downloads/coding_agent
+        """
+        path = os.path.normpath(win_path).replace('\\', '/')
+        if len(path) > 1 and path[1] == ':':
+            path = '/' + path[0].lower() + path[2:]
+        return path.lower()
+    
+    @staticmethod
+    def windows_to_docker_path(win_path):
+        """Convert Windows path to Docker -v compatible format
+        D:\\Downloads\\coding_agent → /d/downloads/coding_agent (for Docker on Windows)
+        """
+        path = win_path.replace('\\', '/')
+        if len(path) > 1 and path[1] == ':':
+            path = '/' + path[0].lower() + path[2:]
+        return path
+    
+    def is_path_covered(self, new_path):
+        """Check if a path is already covered by an existing mount"""
+        new_norm = os.path.normpath(new_path).lower()
+        for existing in self.working_dirs:
+            existing_norm = os.path.normpath(existing).lower()
+            if new_norm.startswith(existing_norm + os.sep) or new_norm == existing_norm:
+                return True
+        return False
+    
+    def add_working_dir(self, path):
+        """Add a working directory. Returns True if added (requires restart), False if already covered."""
+        norm_path = os.path.normpath(path)
+        if self.is_path_covered(norm_path):
+            return False
+        self.working_dirs.append(norm_path)
+        return True
+    
+    def _build_mount_args(self):
+        """Build Docker -v mount arguments for all working directories"""
+        args = []
+        for path in self.working_dirs:
+            docker_path = self.windows_to_docker_path(path)
+            mount_path = self.windows_to_mount_path(path)
+            args.extend(["-v", f"{docker_path}:{mount_path}"])
+        return args
+    
+    def get_mount_info(self):
+        """Get mount information for system prompt"""
+        info = []
+        for path in self.working_dirs:
+            mount_path = self.windows_to_mount_path(path)
+            info.append(f"  - {path} → {mount_path}")
+        return "\n".join(info)
+    
+    def container_exists(self):
+        """Check if container exists (running or stopped)"""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", self.container_name],
+                capture_output=True,
+                text=True
+            )
+            return result.returncode == 0
+        except:
+            return False
+    
+    def container_running(self):
+        """Check if container is currently running"""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
+                capture_output=True,
+                text=True
+            )
+            return result.returncode == 0 and result.stdout.strip() == "true"
+        except:
+            return False
+    
+    def start(self):
+        """Start the container (create if doesn't exist, start if stopped)"""
+        if self.container_running():
+            return {"status": "already_running", "container": self.container_name}
+        
+        if self.container_exists():
+            # Container exists but stopped - start it
+            result = subprocess.run(
+                ["docker", "start", self.container_name],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                return {"status": "started", "container": self.container_name}
+            else:
+                # Container might be corrupted, remove and recreate
+                subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
+        
+        # Create new container
+        return self._create_container()
+    
+    def _create_container(self):
+        """Create a new container with all mounts"""
+        if not self.working_dirs:
+            return {"error": "No working directories to mount"}
+        
+        try:
+            # Pull image first
+            subprocess.run(["docker", "pull", self.image], capture_output=True, text=True)
+            
+            # Build command
+            cmd = ["docker", "run", "-d", "--name", self.container_name]
+            cmd.extend(self._build_mount_args())
+            cmd.extend([self.image, "tail", "-f", "/dev/null"])
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                return {"error": f"Failed to create container: {result.stderr}"}
+            
+            return {"status": "created", "container": self.container_name}
+        
+        except FileNotFoundError:
+            return {"error": "Docker is not installed or not in PATH"}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def restart_with_new_mounts(self):
+        """Stop, remove, and recreate container with updated mounts"""
+        # Stop and remove existing
+        subprocess.run(["docker", "stop", self.container_name], capture_output=True)
+        subprocess.run(["docker", "rm", self.container_name], capture_output=True)
+        
+        # Create with new mounts
+        return self._create_container()
+    
+    def exec(self, command):
+        """Execute command in the container"""
+        if not self.container_running():
+            return {"error": "Container not running"}
+        
+        try:
+            result = subprocess.run(
+                ["docker", "exec", self.container_name, "sh", "-c", command],
+                capture_output=True,
+                text=True
+            )
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def stop(self):
+        """Stop the container (don't remove it)"""
+        if not self.container_exists():
+            return {"status": "not_found"}
+        
+        result = subprocess.run(
+            ["docker", "stop", self.container_name],
+            capture_output=True,
+            text=True
+        )
+        return {"status": "stopped" if result.returncode == 0 else "error"}
+    
+    def remove(self):
+        """Remove the container completely"""
+        subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
+        return {"status": "removed"}
 
 
 class CodingAgent:
@@ -41,41 +224,36 @@ Provide your response in this format:
 (Your answer to the current question)
 [/ANSWER]"""
 
-    def __init__(self, tools, workspace_dir, debug_file=None):
+    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None):
         self.client = anthropic.Anthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY")
         )
         self.model = "claude-opus-4-5-20251101"
-        self.system_message = f"""You are an AI coding assistant with access to a workspace at {workspace_dir}.
-You can execute shell commands, search the web, and fetch documentation.
-
-IMPORTANT: When asked to work with directories OUTSIDE your workspace:
-1. Use the docker_sandbox tool to create a container environment
-2. First call docker_sandbox with action="start" and mount_path="<the external path>"
-3. Then use action="exec" with commands like "ls -la /workspace", "cat /workspace/file.py", etc.
-4. The external directory is mounted at /workspace inside the container with READ-WRITE access
-5. To create files, use heredoc syntax: cat > /workspace/file.py << 'EOF'\n...content...\nEOF
-
-Container behavior:
-- Containers PERSIST across prompts - do NOT stop unless explicitly asked or completely done
-- Multiple directories can be mounted in separate containers simultaneously
-- If a container is already running for a path, it will be reused automatically
-- Only call action="stop" when you are completely finished with that directory
-
-This provides a consistent Linux environment for all file operations.
-
-Always verify your actions and explain what you're doing."""
-
+        self.workspace_dir = workspace_dir
         self.messages = []
         self.tools = tools
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
-        self.workspace_dir = workspace_dir
         self.display_history = []  # Store original user inputs for resume display
+        self.has_interaction = False  # Track if agent had successful response
         
-        # Setup debug log file
+        # Setup debug log file and container
         if debug_file:
             # Resume: use existing debug file
             self.debug_file = debug_file
+            # Extract session name from debug file (debug_YYYYMMDD_HHMMSS.txt)
+            debug_basename = os.path.basename(debug_file)
+            session_name = debug_basename.replace("debug_", "").replace(".txt", "")
+            
+            # Restore or recreate container
+            if container_info:
+                working_dirs = container_info.get("working_dirs", [])
+            else:
+                working_dirs = []
+            
+            self.container_manager = ContainerManager(
+                container_name=f"agent_{session_name}",
+                working_dirs=working_dirs
+            )
             self._log_resume()
         else:
             # New session: create new debug file
@@ -83,7 +261,105 @@ Always verify your actions and explain what you're doing."""
             os.makedirs(debug_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.debug_file = os.path.join(debug_dir, f"debug_{timestamp}.txt")
+            
+            # Create new container manager
+            self.container_manager = ContainerManager(
+                container_name=f"agent_{timestamp}"
+            )
             self._log_session_start()
+        
+        # Build system message with mount info
+        self._update_system_message()
+    
+    def _update_system_message(self):
+        """Update system message with current mount mappings"""
+        mount_info = self.container_manager.get_mount_info()
+        
+        if mount_info:
+            mount_section = f"""
+Current mounted directories (container: {self.container_manager.container_name}):
+{mount_info}
+
+Use these paths directly in docker_sandbox with action="exec"."""
+        else:
+            mount_section = """
+No directories are currently mounted. Use docker_sandbox with action="start" to mount a directory first."""
+        
+        self.system_message = f"""You are an AI coding assistant with access to a workspace at {self.workspace_dir}.
+You can execute shell commands, search the web, and fetch documentation.
+
+IMPORTANT: When asked to work with directories OUTSIDE your workspace:
+1. Use the docker_sandbox tool to create a container environment
+2. First call docker_sandbox with action="start" and mount_path="<the external path>"
+3. Then use action="exec" with commands like "ls -la /d/path/to/dir", etc.
+4. Directories are mounted at their Unix-style path (D:\\path → /d/path)
+5. To create files, use heredoc syntax: cat > /d/path/file.py << 'EOF'\n...content...\nEOF
+{mount_section}
+
+Container behavior:
+- A single container persists for the entire session
+- All directories are mounted in the same container
+- Adding a new directory may require a container restart (you'll be notified)
+- Only call action="stop" when completely finished with all work
+
+This provides a consistent Linux environment for all file operations.
+
+Always verify your actions and explain what you're doing."""
+    
+    def add_working_directory(self, path):
+        """Add a working directory to the container. Returns status message."""
+        needs_restart = self.container_manager.add_working_dir(path)
+        
+        if not needs_restart:
+            mount_path = ContainerManager.windows_to_mount_path(path)
+            return {"status": "already_mounted", "mount_path": mount_path}
+        
+        # Need to restart container with new mount
+        if self.container_manager.container_running():
+            print(f"{Fore.YELLOW}🔄 Restarting container to add new mount...{Style.RESET_ALL}")
+            result = self.container_manager.restart_with_new_mounts()
+        else:
+            result = self.container_manager.start()
+        
+        # Update system message with new mount info
+        self._update_system_message()
+        
+        # Log container info for resume
+        self._log_container_info()
+        
+        mount_path = ContainerManager.windows_to_mount_path(path)
+        result["mount_path"] = mount_path
+        return result
+    
+    def _log_container_info(self):
+        """Log container info to debug file for resume"""
+        info = {
+            "container_name": self.container_manager.container_name,
+            "working_dirs": self.container_manager.working_dirs
+        }
+        self._log_raw(f"\n=== CONTAINER INFO ===")
+        self._log_raw(json.dumps(info))
+    
+    def cleanup_empty_session(self):
+        """Clean up if no interaction occurred. Returns True if cleaned up."""
+        if self.has_interaction:
+            return False
+        
+        # Remove container
+        self.container_manager.remove()
+        
+        # Remove debug file
+        if os.path.exists(self.debug_file):
+            os.remove(self.debug_file)
+            print(f"{Fore.YELLOW}🧹 Cleaned up empty session{Style.RESET_ALL}")
+        
+        return True
+    
+    def stop_container(self):
+        """Stop the container gracefully"""
+        if self.container_manager.container_exists():
+            self.container_manager.stop()
+            print(f"{Fore.CYAN}🐳 Container stopped: {self.container_manager.container_name}{Style.RESET_ALL}")
 
     def _log_session_start(self):
         """Log session start with metadata"""
@@ -91,6 +367,7 @@ Always verify your actions and explain what you're doing."""
         self._log_raw(f"Timestamp: {datetime.now().isoformat()}")
         self._log_raw(f"Workspace: {self.workspace_dir}")
         self._log_raw(f"Model: {self.model}")
+        self._log_raw(f"Container: {self.container_manager.container_name}")
         self._log_raw("")
 
     def _log_resume(self):
@@ -104,19 +381,29 @@ Always verify your actions and explain what you're doing."""
         with open(self.debug_file, "a", encoding="utf-8") as f:
             f.write(message + "\n")
 
-    def _log_turn(self, turn_num, user_input, api_messages, api_response, tool_descriptions=None):
-        """Log a complete turn with structured format"""
+    def _log_turn_start(self, turn_num, user_input):
+        """Log start of a new turn with user input"""
         self._log_raw(f"\n=== TURN {turn_num} ===")
-        self._log_raw(f"--- USER INPUT ---")
-        self._log_raw(user_input)
-        self._log_raw(f"\n--- API MESSAGES ---")
-        self._log_raw(json.dumps(api_messages, indent=2, ensure_ascii=False))
-        self._log_raw(f"\n--- API RESPONSE ---")
-        self._log_raw(json.dumps(api_response, indent=2, default=str, ensure_ascii=False))
-        if tool_descriptions:
-            self._log_raw(f"\n--- TOOL CALLS ---")
-            for desc in tool_descriptions:
-                self._log_raw(desc)
+        self._log_raw(f"--- USER ---")
+        if isinstance(user_input, str):
+            self._log_raw(user_input)
+        else:
+            # Tool results
+            self._log_raw(json.dumps(user_input, indent=2, ensure_ascii=False))
+
+    def _log_assistant(self, content_list):
+        """Log assistant response immediately after API call"""
+        self._log_raw(f"\n--- ASSISTANT ---")
+        self._log_raw(json.dumps(content_list, indent=2, ensure_ascii=False))
+
+    def _log_tool_results(self, tool_results):
+        """Log tool results immediately after execution"""
+        self._log_raw(f"\n--- TOOL_RESULT ---")
+        self._log_raw(json.dumps(tool_results, indent=2, ensure_ascii=False))
+
+    def _log_end_turn(self):
+        """Mark turn as complete"""
+        self._log_raw(f"\n--- END_TURN ---")
 
     def _log_compaction(self, reason, removed_turns, summary_content):
         """Log a compaction event"""
@@ -125,112 +412,6 @@ Always verify your actions and explain what you're doing."""
         self._log_raw(f"Removed turns: {removed_turns}")
         self._log_raw(f"Summary content:\n{summary_content}")
         self._log_raw("")
-
-    def _get_tool_description(self, tool_name, tool_input):
-        """Convert tool call to human-readable description"""
-        if tool_name == "docker_sandbox":
-            action = tool_input.get("action", "")
-            if action == "start":
-                path = tool_input.get("mount_path", "")
-                return f"🐳 Start container: {path}"
-            elif action == "exec":
-                cmd = tool_input.get("command", "")
-                return self._parse_exec_command(cmd)
-            elif action == "stop":
-                path = tool_input.get("mount_path", "")
-                if path:
-                    return f"🐳 Stop container: {path}"
-                return "🐳 Stop all containers"
-            return f"🐳 Docker: {action}"
-        
-        elif tool_name == "execute_command":
-            cmd = tool_input.get("command", "")
-            display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
-            return f"⚡ Run: {display_cmd}"
-        
-        elif tool_name == "web_search":
-            query = tool_input.get("query", "")
-            return f"🔍 Search: {query}"
-        
-        elif tool_name == "fetch_webpage":
-            url = tool_input.get("url", "")
-            # Truncate long URLs
-            display_url = url[:50] + "..." if len(url) > 50 else url
-            return f"🌐 Fetch: {display_url}"
-        
-        return f"🔧 {tool_name}"
-
-    def _parse_exec_command(self, cmd):
-        """Parse exec command into human-readable description"""
-        import re
-        
-        # Handle piped commands: split by | and analyze
-        parts = [p.strip() for p in cmd.split('|')]
-        
-        # Get the main command (first part)
-        main_cmd = parts[0]
-        
-        # Check for line limiting in pipe (head/tail)
-        line_info = ""
-        for part in parts[1:]:
-            head_match = re.match(r'head\s+(?:-n\s*)?(\d+)', part)
-            tail_match = re.match(r'tail\s+(?:-n\s*)?(\d+)', part)
-            if head_match:
-                line_info = f" (first {head_match.group(1)} lines)"
-            elif tail_match:
-                line_info = f" (last {tail_match.group(1)} lines)"
-        
-        # Parse main command
-        if main_cmd.startswith("ls"):
-            return "📂 List files"
-        
-        elif main_cmd.startswith("cat "):
-            # Extract filename: cat /workspace/path/to/file.py
-            match = re.search(r'cat\s+([^|]+)', main_cmd)
-            if match:
-                filepath = match.group(1).strip()
-                filename = filepath.split('/')[-1]
-                return f"📄 Read {filename}{line_info}"
-            return f"📄 Read file{line_info}"
-        
-        elif main_cmd.startswith("head "):
-            # head -n 100 /path/file or head -100 /path/file
-            match = re.match(r'head\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
-            if match:
-                num = match.group(1)
-                filepath = match.group(2)
-                if filepath:
-                    filename = filepath.strip().split('/')[-1]
-                    if num:
-                        return f"📄 Read {filename} (first {num.lstrip('-')} lines)"
-                    return f"📄 Read {filename}"
-            return "📄 Read file"
-        
-        elif main_cmd.startswith("tail "):
-            match = re.match(r'tail\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
-            if match:
-                num = match.group(1)
-                filepath = match.group(2)
-                if filepath:
-                    filename = filepath.strip().split('/')[-1]
-                    if num:
-                        return f"📄 Read {filename} (last {num.lstrip('-')} lines)"
-                    return f"📄 Read {filename}"
-            return "📄 Read file"
-        
-        elif main_cmd.startswith("find "):
-            return "🔎 Find files"
-        
-        elif main_cmd.startswith("grep "):
-            return "🔎 Search in files"
-        
-        elif main_cmd.startswith("wc "):
-            return "📊 Count lines/words"
-        
-        else:
-            # Truncate long commands
-            display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
-            return f"⚡ Run: {display_cmd}"
 
     def _get_tool_schemas(self):
         return [tool.get_schema() for tool in self.tools]
@@ -367,9 +548,18 @@ Always verify your actions and explain what you're doing."""
         return True  # No compaction needed
 
     def chat(self, message):
-        """Send message to Claude"""
+        """Send message to Claude and update messages array"""
         self.messages.append({"role": "user", "content": message})
-
+        response, content_list = self._call_api()
+        self.messages.append({"role": "assistant", "content": content_list})
+        return response
+    
+    def _call_api(self):
+        """Call Claude API with current messages. Does NOT modify self.messages.
+        
+        Returns:
+            tuple: (response, content_list) where content_list is serializable format
+        """
         response = self.client.messages.create(
             model=self.model,
             max_tokens=self.MAX_OUTPUT_TOKENS,
@@ -391,8 +581,7 @@ Always verify your actions and explain what you're doing."""
                     "input": block.input
                 })
 
-        self.messages.append({"role": "assistant", "content": content_list})
-        return response
+        return response, content_list
 
     def run(self, user_input, max_turns=100, initial_messages=None, display_history=None):
         """Main agent loop
@@ -420,17 +609,37 @@ Always verify your actions and explain what you're doing."""
         
         current_input = user_input
         turn_num = len([h for h in self.display_history if h[0] == "user"])
-        tool_descriptions = []
+        is_first_sub_turn = True
 
         for i in range(max_turns):
+            # Log user input / tool results at start of sub-turn
+            if is_first_sub_turn:
+                self._log_turn_start(turn_num, current_input)
+                is_first_sub_turn = False
+            else:
+                # Continuing turn with tool results - already logged in previous iteration
+                pass
+
             response = self.chat(current_input)
 
-            # Collect agent text responses
+            # Convert response to serializable format and log immediately
+            content_list = []
             agent_texts = []
             for block in response.content:
                 if hasattr(block, 'text'):
+                    content_list.append({"type": "text", "text": block.text})
                     print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
                     agent_texts.append(block.text)
+                elif block.type == "tool_use":
+                    content_list.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input
+                    })
+
+            # Log assistant response immediately
+            self._log_assistant(content_list)
 
             # Handle tool use
             if response.stop_reason == "tool_use":
@@ -442,9 +651,9 @@ Always verify your actions and explain what you're doing."""
                         tool_input = block.input
 
                         # Print concise description to console
-                        description = self._get_tool_description(tool_name, tool_input)
+                        description = get_tool_description(tool_name, tool_input)
                         print(f"{Fore.YELLOW}{description}{Style.RESET_ALL}")
-                        tool_descriptions.append(description)
+                        self.display_history.append(("tool", description))
 
                         # Execute tool
                         tool = self.tool_map[tool_name]
@@ -460,20 +669,18 @@ Always verify your actions and explain what you're doing."""
                             "content": json.dumps(result)
                         })
 
+                # Log tool results immediately
+                self._log_tool_results(tool_results)
                 current_input = tool_results
             else:
-                # Agent finished - log the complete turn
+                # Agent finished - mark as having interaction
+                self.has_interaction = True
+                
+                # Log end of turn
+                self._log_end_turn()
+                
                 if agent_texts:
                     self.display_history.append(("assistant", "\n".join(agent_texts)))
-                
-                # Log turn to debug file
-                self._log_turn(
-                    turn_num,
-                    user_input,
-                    self.messages,
-                    {"content": agent_texts, "stop_reason": response.stop_reason},
-                    tool_descriptions
-                )
                 
                 return response
 
@@ -481,9 +688,113 @@ Always verify your actions and explain what you're doing."""
         self._log_raw("Max turns reached")
         return response
 
+    def continue_incomplete_turn(self, incomplete_turn, max_turns=100):
+        """Continue an incomplete turn from a crash
+        
+        Args:
+            incomplete_turn: dict with 'type' and relevant data
+                - {"type": "continue"} - messages already has tool_results, just call API
+                - {"type": "execute_tools", "tool_uses": [...]} - execute tools, add to messages, then call API
+            max_turns: Maximum remaining tool-use iterations
+        """
+        if incomplete_turn["type"] == "execute_tools":
+            # Need to execute tools that weren't run before crash
+            tool_uses = incomplete_turn["tool_uses"]
+            tool_results = []
+            
+            for tool_use in tool_uses:
+                tool_name = tool_use["name"]
+                tool_input = tool_use["input"]
+                
+                description = get_tool_description(tool_name, tool_input)
+                print(f"{Fore.YELLOW}(Executing) {description}{Style.RESET_ALL}")
+                
+                tool = self.tool_map[tool_name]
+                result = tool.execute(**tool_input)
+                
+                if "error" in result:
+                    print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use["id"],
+                    "content": json.dumps(result)
+                })
+            
+            # Add tool results to messages and log
+            self.messages.append({"role": "user", "content": tool_results})
+            self._log_tool_results(tool_results)
+            
+        elif incomplete_turn["type"] == "continue":
+            # Messages already has everything (including tool_results)
+            # Just need to call API to continue generation
+            pass
+        else:
+            print(f"{Fore.RED}Unknown incomplete turn type: {incomplete_turn['type']}{Style.RESET_ALL}")
+            return None
+        
+        # Continue the agent loop - call API with current messages
+        for i in range(max_turns):
+            # Call API without modifying messages first (they're already set up)
+            response, content_list = self._call_api()
+            
+            # Add assistant response to messages
+            self.messages.append({"role": "assistant", "content": content_list})
+            
+            # Extract text and log
+            agent_texts = [b["text"] for b in content_list if b.get("type") == "text"]
+            for text in agent_texts:
+                print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
+            
+            # Log assistant response immediately
+            self._log_assistant(content_list)
+            
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_name = block.name
+                        tool_input = block.input
+                        
+                        description = get_tool_description(tool_name, tool_input)
+                        print(f"{Fore.YELLOW}{description}{Style.RESET_ALL}")
+                        self.display_history.append(("tool", description))
+                        
+                        tool = self.tool_map[tool_name]
+                        result = tool.execute(**tool_input)
+                        
+                        if "error" in result:
+                            print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
+                        
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result)
+                        })
+                
+                # Add tool results to messages and log
+                self.messages.append({"role": "user", "content": tool_results})
+                self._log_tool_results(tool_results)
+            else:
+                self.has_interaction = True
+                self._log_end_turn()
+                
+                if agent_texts:
+                    self.display_history.append(("assistant", "\n".join(agent_texts)))
+                
+                return response
+        
+        print(f"{Fore.RED}Max turns reached{Style.RESET_ALL}")
+        return response
+
     def get_state_for_resume(self):
         """Get current state for saving/resuming"""
         return {
             "messages": self.messages,
-            "display_history": self.display_history
+            "display_history": self.display_history,
+            "container_info": {
+                "container_name": self.container_manager.container_name,
+                "working_dirs": self.container_manager.working_dirs
+            }
         }
