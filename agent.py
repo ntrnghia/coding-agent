@@ -12,6 +12,16 @@ class CodingAgent:
         self.model = "claude-opus-4-5"
         self.system_message = f"""You are an AI coding assistant with access to a workspace at {workspace_dir}.
 You can execute shell commands, search the web, and fetch documentation.
+
+IMPORTANT: When asked to explore or analyze directories OUTSIDE your workspace:
+1. Use the docker_sandbox tool to create a safe container environment
+2. First call docker_sandbox with action="start" and mount_path="<the external path>"
+3. Then use action="exec" with commands like "ls -la /workspace", "cat /workspace/file.py", etc.
+4. The external directory is mounted read-only at /workspace inside the container
+5. When done, call action="stop" to clean up
+
+This keeps the host system safe while allowing full exploration of external code.
+
 Always verify your actions and explain what you're doing."""
 
         self.messages = []
@@ -36,7 +46,7 @@ Always verify your actions and explain what you're doing."""
         self.messages.append({"role": "assistant", "content": response.content})
         return response
 
-    def run(self, user_input, max_turns=10):
+    def run(self, user_input, max_turns=100):
         """Main agent loop"""
         current_input = user_input
 

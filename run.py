@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os
-from tools import TerminalTool, WebSearchTool, FetchWebTool
+from tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool
 from agent import CodingAgent
 
 def main():
@@ -18,10 +18,11 @@ def main():
     terminal = TerminalTool(workspace)
     web_search = WebSearchTool()
     fetch_web = FetchWebTool()
+    docker_sandbox = DockerSandboxTool()
 
     # Create agent
     agent = CodingAgent(
-        tools=[terminal, web_search, fetch_web],
+        tools=[terminal, web_search, fetch_web, docker_sandbox],
         workspace_dir=workspace
     )
 
