@@ -1,6 +1,12 @@
 import anthropic
 import json
 import os
+from datetime import datetime
+from colorama import Fore, Style, init
+
+# Initialize colorama
+init(autoreset=True)
+
 
 class CodingAgent:
     """Minimal AI agent for coding workspace"""
@@ -27,6 +33,71 @@ Always verify your actions and explain what you're doing."""
         self.messages = []
         self.tools = tools
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
+        self.workspace_dir = workspace_dir
+        
+        # Setup debug log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.debug_file = os.path.join(workspace_dir, f"debug_{timestamp}.txt")
+        self._log_debug(f"Session started at {datetime.now().isoformat()}")
+        self._log_debug(f"Workspace: {workspace_dir}")
+
+    def _log_debug(self, message):
+        """Write debug message to log file"""
+        with open(self.debug_file, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+    def _get_tool_description(self, tool_name, tool_input):
+        """Convert tool call to human-readable description"""
+        if tool_name == "docker_sandbox":
+            action = tool_input.get("action", "")
+            if action == "start":
+                path = tool_input.get("mount_path", "")
+                return f"🐳 Start container: {path}"
+            elif action == "exec":
+                cmd = tool_input.get("command", "")
+                if cmd.startswith("ls"):
+                    return "📂 List files"
+                elif cmd.startswith("cat "):
+                    # Extract filename from path
+                    parts = cmd.split()
+                    if len(parts) > 1:
+                        filename = parts[-1].split("/")[-1]
+                        return f"📄 Read {filename}"
+                    return "📄 Read file"
+                elif cmd.startswith("head ") or cmd.startswith("tail "):
+                    parts = cmd.split()
+                    if len(parts) > 1:
+                        filename = parts[-1].split("/")[-1]
+                        return f"📄 Read {filename}"
+                    return "📄 Read file"
+                elif cmd.startswith("find "):
+                    return "🔎 Find files"
+                elif cmd.startswith("grep "):
+                    return "🔎 Search in files"
+                else:
+                    # Truncate long commands
+                    display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
+                    return f"⚡ Run: {display_cmd}"
+            elif action == "stop":
+                return "🐳 Stop container"
+            return f"🐳 Docker: {action}"
+        
+        elif tool_name == "execute_command":
+            cmd = tool_input.get("command", "")
+            display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
+            return f"⚡ Run: {display_cmd}"
+        
+        elif tool_name == "web_search":
+            query = tool_input.get("query", "")
+            return f"🔍 Search: {query}"
+        
+        elif tool_name == "fetch_webpage":
+            url = tool_input.get("url", "")
+            # Truncate long URLs
+            display_url = url[:50] + "..." if len(url) > 50 else url
+            return f"🌐 Fetch: {display_url}"
+        
+        return f"🔧 {tool_name}"
 
     def _get_tool_schemas(self):
         return [tool.get_schema() for tool in self.tools]
@@ -49,18 +120,19 @@ Always verify your actions and explain what you're doing."""
     def run(self, user_input, max_turns=100):
         """Main agent loop"""
         current_input = user_input
+        self._log_debug(f"\n{'='*60}")
+        self._log_debug(f"User input: {user_input}")
 
         for i in range(max_turns):
-            print(f"\n{'='*60}")
-            print(f"Turn {i+1}")
-            print(f"{'='*60}")
+            self._log_debug(f"\n--- Turn {i+1} ---")
 
             response = self.chat(current_input)
 
             # Print text responses
             for block in response.content:
                 if hasattr(block, 'text'):
-                    print(f"\nAgent: {block.text}")
+                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
+                    self._log_debug(f"Agent: {block.text}")
 
             # Handle tool use
             if response.stop_reason == "tool_use":
@@ -71,14 +143,24 @@ Always verify your actions and explain what you're doing."""
                         tool_name = block.name
                         tool_input = block.input
 
-                        print(f"\n[Using tool: {tool_name}]")
-                        print(f"Input: {json.dumps(tool_input, indent=2)}")
+                        # Log full details to debug file
+                        self._log_debug(f"\n[Tool: {tool_name}]")
+                        self._log_debug(f"Input: {json.dumps(tool_input, indent=2)}")
+
+                        # Print concise description to console
+                        description = self._get_tool_description(tool_name, tool_input)
+                        print(f"{Fore.YELLOW}{description}{Style.RESET_ALL}")
 
                         # Execute tool
                         tool = self.tool_map[tool_name]
                         result = tool.execute(**tool_input)
 
-                        print(f"Output: {json.dumps(result, indent=2)[:500]}...")
+                        # Log full output to debug file
+                        self._log_debug(f"Output: {json.dumps(result, indent=2)}")
+
+                        # Only print errors to console
+                        if "error" in result:
+                            print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
 
                         tool_results.append({
                             "type": "tool_result",
@@ -91,5 +173,6 @@ Always verify your actions and explain what you're doing."""
                 # Agent finished
                 return response
 
-        print("\nMax turns reached")
+        print(f"{Fore.RED}Max turns reached{Style.RESET_ALL}")
+        self._log_debug("Max turns reached")
         return response

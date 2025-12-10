@@ -2,3 +2,4 @@ anthropic
 ddgs
 requests
 beautifulsoup4
+colorama
