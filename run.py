@@ -281,7 +281,7 @@ def main():
         print(f"{Fore.GREEN}Coding Agent initialized in: {workspace}")
     print(f"{Fore.CYAN}Debug logs: {agent.debug_file}")
     print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
-    print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Type 'exit' to quit\n")
+    print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit\n")
 
     # If resuming with incomplete turn, continue it first
     if incomplete_turn:
@@ -302,10 +302,6 @@ def main():
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 print(f"\n{Fore.GREEN}Goodbye!")
-                break
-
-            if user_input.lower() == 'exit':
-                print(f"{Fore.GREEN}Goodbye!")
                 break
 
             if not user_input:

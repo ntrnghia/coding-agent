@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from colorama import Fore, Style, init
 from tools import get_tool_description
@@ -156,16 +157,30 @@ class ContainerManager:
         return self._create_container()
     
     def exec(self, command):
-        """Execute command in the container"""
-        if not self.container_running():
-            return {"error": "Container not running"}
-        
+        """Execute command in the container. Auto-recovers if container not running."""
         try:
             result = subprocess.run(
                 ["docker", "exec", self.container_name, "sh", "-c", command],
                 capture_output=True,
                 text=True
             )
+            
+            # Check if container doesn't exist or isn't running
+            if result.returncode != 0 and "No such container" in result.stderr:
+                # Try to start/create container and retry once
+                if self.working_dirs:
+                    start_result = self.start()
+                    if start_result.get("error"):
+                        return {"error": f"Container not running and failed to start: {start_result['error']}"}
+                    # Retry the command
+                    result = subprocess.run(
+                        ["docker", "exec", self.container_name, "sh", "-c", command],
+                        capture_output=True,
+                        text=True
+                    )
+                else:
+                    return {"error": "Container not running. Use action='start' to mount a directory first."}
+            
             return {
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -234,24 +249,29 @@ Provide your response in this format:
         self.tools = tools
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
         self.display_history = []  # Store original user inputs for resume display
-        self.has_interaction = False  # Track if agent had successful response
         
         # Setup debug log file and container
         if debug_file:
             # Resume: use existing debug file
             self.debug_file = debug_file
-            # Extract session name from debug file (debug_YYYYMMDD_HHMMSS.txt)
-            debug_basename = os.path.basename(debug_file)
-            session_name = debug_basename.replace("debug_", "").replace(".txt", "")
             
-            # Restore or recreate container
-            if container_info:
+            # Get container name from stored info (resilient to filename changes)
+            if container_info and container_info.get("container_name"):
+                container_name = container_info["container_name"]
                 working_dirs = container_info.get("working_dirs", [])
             else:
+                # Fallback: derive from filename
+                debug_basename = os.path.basename(debug_file)
+                session_name = debug_basename.replace("debug_", "").replace(".txt", "")
+                container_name = f"agent_{session_name}"
                 working_dirs = []
             
+            # Ensure workspace is in working_dirs for resume
+            if workspace_dir not in working_dirs:
+                working_dirs.append(workspace_dir)
+            
             self.container_manager = ContainerManager(
-                container_name=f"agent_{session_name}",
+                container_name=container_name,
                 working_dirs=working_dirs
             )
             self._log_resume()
@@ -262,14 +282,32 @@ Provide your response in this format:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.debug_file = os.path.join(debug_dir, f"debug_{timestamp}.txt")
             
-            # Create new container manager
+            # Create new container manager with workspace pre-mounted
             self.container_manager = ContainerManager(
-                container_name=f"agent_{timestamp}"
+                container_name=f"agent_{timestamp}",
+                working_dirs=[workspace_dir]  # Auto-mount workspace
             )
             self._log_session_start()
         
+        # Start container with workspace mounted
+        self._ensure_container_started()
+        
         # Build system message with mount info
         self._update_system_message()
+    
+    def _ensure_container_started(self):
+        """Ensure the container is started with all mounts"""
+        if self.container_manager.working_dirs:
+            print(f"{Fore.YELLOW}🐳 Starting Docker container...{Style.RESET_ALL}")
+            result = self.container_manager.start()
+            if "error" in result:
+                print(f"{Fore.RED}⚠️  Docker error: {result['error']}{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}   File operations will use Windows commands as fallback.{Style.RESET_ALL}")
+            elif result.get("status") == "already_running":
+                print(f"{Fore.GREEN}🐳 Container already running: {self.container_manager.container_name}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.GREEN}🐳 Container ready: {self.container_manager.container_name}{Style.RESET_ALL}")
+                self._log_container_info()
     
     def _update_system_message(self):
         """Update system message with current mount mappings"""
@@ -285,24 +323,39 @@ Use these paths directly in docker_sandbox with action="exec"."""
             mount_section = """
 No directories are currently mounted. Use docker_sandbox with action="start" to mount a directory first."""
         
-        self.system_message = f"""You are an AI coding assistant with access to a workspace at {self.workspace_dir}.
-You can execute shell commands, search the web, and fetch documentation.
+        self.system_message = f"""You are an AI coding assistant. Your workspace is at {self.workspace_dir}.
+You can search the web and fetch documentation.
 
-IMPORTANT: When asked to work with directories OUTSIDE your workspace:
-1. Use the docker_sandbox tool to create a container environment
-2. First call docker_sandbox with action="start" and mount_path="<the external path>"
-3. Then use action="exec" with commands like "ls -la /d/path/to/dir", etc.
-4. Directories are mounted at their Unix-style path (D:\\path → /d/path)
-5. To create files, use heredoc syntax: cat > /d/path/file.py << 'EOF'\n...content...\nEOF
+CRITICAL: For ALL file operations (reading, writing, listing, searching), you MUST use the docker_sandbox tool.
+This provides a consistent Linux environment with standard Unix tools (ls, cat, grep, find, etc.).
+
+How to use docker_sandbox:
+1. First mount the directory: docker_sandbox with action="start" and mount_path="<path>"
+2. Then run commands: docker_sandbox with action="exec" and command="<unix command>"
+3. Paths are mapped: D:\\path → /d/path (Unix-style)
+
+Your workspace is already mounted at startup. To access it:
+- docker_sandbox action="exec" command="ls -la /d/downloads/project"
+- docker_sandbox action="exec" command="cat /d/downloads/project/file.py"
 {mount_section}
+
+DO NOT use execute_command for file operations - it runs on Windows and lacks Unix tools.
+Use execute_command ONLY for Windows-specific tasks (like running Python scripts with specific Windows paths).
+
+File operation examples in Docker:
+- List files: ls -la /d/path
+- Read file: cat /d/path/file.py
+- Search: grep -r "pattern" /d/path
+- Find files: find /d/path -name "*.py"
+- Write file: cat > /d/path/file.py << 'EOF'
+...content...
+EOF
 
 Container behavior:
 - A single container persists for the entire session
 - All directories are mounted in the same container
 - Adding a new directory may require a container restart (you'll be notified)
 - Only call action="stop" when completely finished with all work
-
-This provides a consistent Linux environment for all file operations.
 
 Always verify your actions and explain what you're doing."""
     
@@ -341,8 +394,14 @@ Always verify your actions and explain what you're doing."""
         self._log_raw(json.dumps(info))
     
     def cleanup_empty_session(self):
-        """Clean up if no interaction occurred. Returns True if cleaned up."""
-        if self.has_interaction:
+        """Clean up if no user messages. Returns True if cleaned up."""
+        # Check if there are any user messages in the conversation
+        has_user_message = any(
+            msg.get("role") == "user" and isinstance(msg.get("content"), str)
+            for msg in self.messages
+        )
+        
+        if has_user_message:
             return False
         
         # Remove container
@@ -557,16 +616,34 @@ Always verify your actions and explain what you're doing."""
     def _call_api(self):
         """Call Claude API with current messages. Does NOT modify self.messages.
         
+        Implements retry using retry-after header for rate limit errors.
+        
         Returns:
             tuple: (response, content_list) where content_list is serializable format
         """
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.MAX_OUTPUT_TOKENS,
-            system=self.system_message,
-            tools=self._get_tool_schemas(),
-            messages=self.messages
-        )
+        max_retries = 3
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.MAX_OUTPUT_TOKENS,
+                    system=self.system_message,
+                    tools=self._get_tool_schemas(),
+                    messages=self.messages
+                )
+                break  # Success, exit retry loop
+            except anthropic.RateLimitError as e:
+                if attempt == max_retries:
+                    print(f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}")
+                    raise
+                # Get retry-after from response headers, fallback to 30s
+                retry_after = None
+                if hasattr(e, 'response') and e.response is not None:
+                    retry_after = e.response.headers.get("retry-after")
+                delay = int(retry_after) if retry_after else 30
+                print(f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}")
+                time.sleep(delay)
 
         # Convert response.content to serializable format for storage
         content_list = []
@@ -673,8 +750,7 @@ Always verify your actions and explain what you're doing."""
                 self._log_tool_results(tool_results)
                 current_input = tool_results
             else:
-                # Agent finished - mark as having interaction
-                self.has_interaction = True
+                # Agent finished
                 
                 # Log end of turn
                 self._log_end_turn()
@@ -777,7 +853,6 @@ Always verify your actions and explain what you're doing."""
                 self.messages.append({"role": "user", "content": tool_results})
                 self._log_tool_results(tool_results)
             else:
-                self.has_interaction = True
                 self._log_end_turn()
                 
                 if agent_texts:

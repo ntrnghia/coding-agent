@@ -60,7 +60,20 @@ def _parse_exec_command(cmd):
     if main_cmd.startswith("ls"):
         return "📂 List files"
     
-    elif main_cmd.startswith("cat "):
+    # Write/Edit file: cat > file.py or cat >> file.py
+    elif main_cmd.startswith("cat >") or main_cmd.startswith("cat>>"):
+        # Extract filename between > and << (or end)
+        match = re.search(r'cat\s*>>?\s*([^\s<]+)', main_cmd)
+        if match:
+            filepath = match.group(1).strip()
+            filename = filepath.split('/')[-1]
+            if ">>" in main_cmd:
+                return f"✏️ Append to {filename}"
+            return f"✏️ Edit {filename}"
+        return "✏️ Edit file"
+    
+    # Read file: cat file.py (no > redirect)
+    elif main_cmd.startswith("cat ") and ">" not in main_cmd:
         match = re.search(r'cat\s+([^|]+)', main_cmd)
         if match:
             filepath = match.group(1).strip()
@@ -366,15 +379,6 @@ Examples:
             return {"error": "command is required for 'exec' action"}
 
         cm = self.agent_ref.container_manager
-        
-        if not cm.container_running():
-            if not cm.working_dirs:
-                return {"error": "No directories mounted. Use action='start' first."}
-            # Start container if not running
-            result = cm.start()
-            if result.get("error"):
-                return {"error": result["error"]}
-
         return cm.exec(command)
 
     def _stop_container(self):

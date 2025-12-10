@@ -4,18 +4,19 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 
 ## Features
 
-- **Terminal execution**: Run shell commands in your workspace
+- **Docker-first file operations**: All file operations run in a Docker container with Unix tools
 - **Web search**: Search using DuckDuckGo (ddgs package)
 - **Web fetching**: Fetch and read webpage content
-- **Docker sandbox**: Safely explore external directories in isolated containers
-- **Persistent container**: Single container per session with multiple mount support
+- **Terminal execution**: Run Windows commands when needed
+- **Persistent container**: Single container per session, auto-starts on launch
 - **Command denylist**: Dangerous commands require user confirmation
 - **Colored output**: Easy-to-read console with color-coded messages
 - **Debug logging**: Incremental logging to `debug/` folder (crash-resilient)
 - **Resume sessions**: Continue previous conversations with `-r` flag
 - **Mid-turn resume**: Automatically recovers from crashes mid-tool-execution
 - **Auto-compact**: Automatically summarizes context when approaching token limit
-- **Auto-cleanup**: Empty conversations (no interaction) are automatically deleted
+- **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
+- **Rate limit handling**: Automatically waits and retries using `retry-after` header
 
 ## Setup
 
@@ -56,7 +57,7 @@ python run.py -r debug/debug_20251210_120000.txt
 **Input controls:**
 - `Shift+Enter` - New line (shows `\`)
 - `Enter` - Submit message
-- `exit` - Quit the agent
+- `Ctrl+C` - Exit the agent
 
 Example prompts:
 - "Create a new Python project with main.py and tests/"
@@ -88,12 +89,14 @@ Searches the web using DuckDuckGo, returns top 10 results.
 Fetches and extracts text content from URLs.
 
 ### Docker Sandbox Tool
-Safely explore external directories in isolated Docker containers:
+All file operations run in a Docker container for consistent Unix environment:
+- **Auto-starts on launch** with workspace pre-mounted
 - **Single persistent container** per session (named `agent_<timestamp>`)
 - Directories mounted at Unix-style paths: `D:\Downloads\project` → `/d/downloads/project`
 - Read-write access to all mounted directories
 - Multiple directories can be mounted dynamically
 - Container persists across prompts and survives resume
+- **Lazy recovery**: If container stops, auto-restarts on next command
 - Uses `python:slim` image by default
 
 ## Context Management
@@ -151,7 +154,7 @@ Each block is written immediately, so even if the agent crashes, the debug file 
 
 The agent uses colored output for readability:
 - 🟢 **Green**: Agent messages
-- 🟡 **Yellow**: Tool operations (📂 List files, 📄 Read file, 🐳 Docker, etc.)
+- 🟡 **Yellow**: Tool operations (📂 List files, 📄 Read file, ✏️ Edit file, 🐳 Docker, etc.)
 - 🔵 **Cyan**: User prompts
 - 🔴 **Red**: Errors
 
