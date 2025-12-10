@@ -1,5 +1,5 @@
 import subprocess
-import json
+import os
 from ddgs import DDGS
 import requests
 from bs4 import BeautifulSoup
@@ -168,8 +168,8 @@ class DockerSandboxTool:
     DEFAULT_IMAGE = "python:3.11-slim"
 
     def __init__(self, confirm_callback=None):
-        self.container_id = None
-        self.mounted_path = None
+        self.containers = {}  # {mount_path: container_id}
+        self.active_path = None  # Track last-used container
         self.confirm_callback = confirm_callback or self._default_confirm
 
     def _default_confirm(self, message):
@@ -182,17 +182,21 @@ class DockerSandboxTool:
         return {
             "name": "docker_sandbox",
             "description": """Execute commands in a Docker sandbox. Use this for safely exploring external directories or running untrusted code.
+
+Containers persist across prompts - only stop when completely done with a directory.
+Multiple directories can be mounted in separate containers simultaneously.
             
 Actions:
-- 'start': Start a new container with a directory mounted at /workspace. Requires 'mount_path'.
-- 'exec': Execute a command inside the running container. Requires 'command'.
-- 'stop': Stop and remove the running container.
+- 'start': Start a container with a directory mounted at /workspace. If already running for that path, reuses it.
+- 'exec': Execute a command inside the active container.
+- 'stop': Stop container(s). Optionally specify mount_path to stop specific one, otherwise stops all.
 
 Examples:
 - Start: {"action": "start", "mount_path": "D:\\\\Downloads\\\\some-project"}
 - Execute: {"action": "exec", "command": "ls -la /workspace"}
 - Execute: {"action": "exec", "command": "cat /workspace/main.py"}
-- Stop: {"action": "stop"}""",
+- Stop specific: {"action": "stop", "mount_path": "D:\\\\Downloads\\\\some-project"}
+- Stop all: {"action": "stop"}""",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -203,7 +207,7 @@ Examples:
                     },
                     "mount_path": {
                         "type": "string",
-                        "description": "Path to mount into container (required for 'start' action)"
+                        "description": "Path to mount into container (required for 'start', optional for 'stop' to stop specific container)"
                     },
                     "command": {
                         "type": "string",
@@ -227,7 +231,7 @@ Examples:
         elif action == "exec":
             return self._exec_command(command)
         elif action == "stop":
-            return self._stop_container()
+            return self._stop_container(mount_path)
         else:
             return {"error": f"Unknown action: {action}"}
 
@@ -236,9 +240,19 @@ Examples:
         if not mount_path:
             return {"error": "mount_path is required for 'start' action"}
 
-        # Stop existing container if running
-        if self.container_id:
-            self._stop_container()
+        # Normalize path for comparison
+        norm_path = os.path.normpath(mount_path)
+        
+        # Check if container already exists for this path
+        if norm_path in self.containers:
+            self.active_path = norm_path
+            return {
+                "status": "Container already running",
+                "container_id": self.containers[norm_path],
+                "mounted_path": mount_path,
+                "workspace": "/workspace",
+                "image": image
+            }
 
         # Convert Windows path to Docker-compatible format
         docker_path = mount_path.replace('\\', '/')
@@ -270,12 +284,13 @@ Examples:
             if result.returncode != 0:
                 return {"error": f"Failed to start container: {result.stderr}"}
 
-            self.container_id = result.stdout.strip()[:12]
-            self.mounted_path = mount_path
+            container_id = result.stdout.strip()[:12]
+            self.containers[norm_path] = container_id
+            self.active_path = norm_path
 
             return {
                 "status": "Container started",
-                "container_id": self.container_id,
+                "container_id": container_id,
                 "mounted_path": mount_path,
                 "workspace": "/workspace",
                 "image": image,
@@ -288,16 +303,18 @@ Examples:
             return {"error": str(e)}
 
     def _exec_command(self, command):
-        """Execute command in running container"""
-        if not self.container_id:
+        """Execute command in active container"""
+        if not self.active_path or self.active_path not in self.containers:
             return {"error": "No container running. Use action='start' first."}
 
         if not command:
             return {"error": "command is required for 'exec' action"}
 
+        container_id = self.containers[self.active_path]
+
         try:
             result = subprocess.run(
-                ["docker", "exec", self.container_id, "sh", "-c", command],
+                ["docker", "exec", container_id, "sh", "-c", command],
                 capture_output=True,
                 text=True
             )
@@ -311,23 +328,44 @@ Examples:
         except Exception as e:
             return {"error": str(e)}
 
-    def _stop_container(self):
-        """Stop and remove the running container"""
-        if not self.container_id:
-            return {"status": "No container running"}
+    def _stop_container(self, mount_path=None):
+        """Stop container(s). If mount_path specified, stop only that one. Otherwise stop all."""
+        if mount_path:
+            # Stop specific container
+            norm_path = os.path.normpath(mount_path)
+            if norm_path not in self.containers:
+                return {"status": "No container running for that path"}
 
-        try:
-            subprocess.run(
-                ["docker", "stop", self.container_id],
-                capture_output=True,
-                text=True
-            )
+            container_id = self.containers[norm_path]
+            try:
+                subprocess.run(
+                    ["docker", "stop", container_id],
+                    capture_output=True,
+                    text=True
+                )
+                del self.containers[norm_path]
+                if self.active_path == norm_path:
+                    self.active_path = next(iter(self.containers), None)
+                return {"status": "Container stopped", "container_id": container_id, "path": mount_path}
+            except Exception as e:
+                return {"error": str(e)}
+        else:
+            # Stop all containers
+            if not self.containers:
+                return {"status": "No containers running"}
 
-            old_id = self.container_id
-            self.container_id = None
-            self.mounted_path = None
-
-            return {"status": "Container stopped", "container_id": old_id}
-
-        except Exception as e:
-            return {"error": str(e)}
+            stopped = []
+            for path, container_id in list(self.containers.items()):
+                try:
+                    subprocess.run(
+                        ["docker", "stop", container_id],
+                        capture_output=True,
+                        text=True
+                    )
+                    stopped.append({"container_id": container_id, "path": path})
+                except Exception:
+                    pass
+            
+            self.containers.clear()
+            self.active_path = None
+            return {"status": "All containers stopped", "stopped": stopped}

@@ -24,7 +24,12 @@ IMPORTANT: When asked to explore or analyze directories OUTSIDE your workspace:
 2. First call docker_sandbox with action="start" and mount_path="<the external path>"
 3. Then use action="exec" with commands like "ls -la /workspace", "cat /workspace/file.py", etc.
 4. The external directory is mounted read-only at /workspace inside the container
-5. When done, call action="stop" to clean up
+
+Container behavior:
+- Containers PERSIST across prompts - do NOT stop unless explicitly asked or completely done
+- Multiple directories can be mounted in separate containers simultaneously
+- If a container is already running for a path, it will be reused automatically
+- Only call action="stop" when you are completely finished with that directory
 
 This keeps the host system safe while allowing full exploration of external code.
 
@@ -35,9 +40,11 @@ Always verify your actions and explain what you're doing."""
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
         self.workspace_dir = workspace_dir
         
-        # Setup debug log file
+        # Setup debug log file in debug folder
+        debug_dir = os.path.join(workspace_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.debug_file = os.path.join(workspace_dir, f"debug_{timestamp}.txt")
+        self.debug_file = os.path.join(debug_dir, f"debug_{timestamp}.txt")
         self._log_debug(f"Session started at {datetime.now().isoformat()}")
         self._log_debug(f"Workspace: {workspace_dir}")
 
@@ -55,31 +62,12 @@ Always verify your actions and explain what you're doing."""
                 return f"🐳 Start container: {path}"
             elif action == "exec":
                 cmd = tool_input.get("command", "")
-                if cmd.startswith("ls"):
-                    return "📂 List files"
-                elif cmd.startswith("cat "):
-                    # Extract filename from path
-                    parts = cmd.split()
-                    if len(parts) > 1:
-                        filename = parts[-1].split("/")[-1]
-                        return f"📄 Read {filename}"
-                    return "📄 Read file"
-                elif cmd.startswith("head ") or cmd.startswith("tail "):
-                    parts = cmd.split()
-                    if len(parts) > 1:
-                        filename = parts[-1].split("/")[-1]
-                        return f"📄 Read {filename}"
-                    return "📄 Read file"
-                elif cmd.startswith("find "):
-                    return "🔎 Find files"
-                elif cmd.startswith("grep "):
-                    return "🔎 Search in files"
-                else:
-                    # Truncate long commands
-                    display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
-                    return f"⚡ Run: {display_cmd}"
+                return self._parse_exec_command(cmd)
             elif action == "stop":
-                return "🐳 Stop container"
+                path = tool_input.get("mount_path", "")
+                if path:
+                    return f"🐳 Stop container: {path}"
+                return "🐳 Stop all containers"
             return f"🐳 Docker: {action}"
         
         elif tool_name == "execute_command":
@@ -98,6 +86,78 @@ Always verify your actions and explain what you're doing."""
             return f"🌐 Fetch: {display_url}"
         
         return f"🔧 {tool_name}"
+
+    def _parse_exec_command(self, cmd):
+        """Parse exec command into human-readable description"""
+        import re
+        
+        # Handle piped commands: split by | and analyze
+        parts = [p.strip() for p in cmd.split('|')]
+        
+        # Get the main command (first part)
+        main_cmd = parts[0]
+        
+        # Check for line limiting in pipe (head/tail)
+        line_info = ""
+        for part in parts[1:]:
+            head_match = re.match(r'head\s+(?:-n\s*)?(\d+)', part)
+            tail_match = re.match(r'tail\s+(?:-n\s*)?(\d+)', part)
+            if head_match:
+                line_info = f" (first {head_match.group(1)} lines)"
+            elif tail_match:
+                line_info = f" (last {tail_match.group(1)} lines)"
+        
+        # Parse main command
+        if main_cmd.startswith("ls"):
+            return "📂 List files"
+        
+        elif main_cmd.startswith("cat "):
+            # Extract filename: cat /workspace/path/to/file.py
+            match = re.search(r'cat\s+([^|]+)', main_cmd)
+            if match:
+                filepath = match.group(1).strip()
+                filename = filepath.split('/')[-1]
+                return f"📄 Read {filename}{line_info}"
+            return f"📄 Read file{line_info}"
+        
+        elif main_cmd.startswith("head "):
+            # head -n 100 /path/file or head -100 /path/file
+            match = re.match(r'head\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
+            if match:
+                num = match.group(1)
+                filepath = match.group(2)
+                if filepath:
+                    filename = filepath.strip().split('/')[-1]
+                    if num:
+                        return f"📄 Read {filename} (first {num.lstrip('-')} lines)"
+                    return f"📄 Read {filename}"
+            return "📄 Read file"
+        
+        elif main_cmd.startswith("tail "):
+            match = re.match(r'tail\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
+            if match:
+                num = match.group(1)
+                filepath = match.group(2)
+                if filepath:
+                    filename = filepath.strip().split('/')[-1]
+                    if num:
+                        return f"📄 Read {filename} (last {num.lstrip('-')} lines)"
+                    return f"📄 Read {filename}"
+            return "📄 Read file"
+        
+        elif main_cmd.startswith("find "):
+            return "🔎 Find files"
+        
+        elif main_cmd.startswith("grep "):
+            return "🔎 Search in files"
+        
+        elif main_cmd.startswith("wc "):
+            return "📊 Count lines/words"
+        
+        else:
+            # Truncate long commands
+            display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
+            return f"⚡ Run: {display_cmd}"
 
     def _get_tool_schemas(self):
         return [tool.get_schema() for tool in self.tools]
