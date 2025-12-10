@@ -3,3 +3,4 @@ ddgs
 requests
 beautifulsoup4
 colorama
+prompt_toolkit

@@ -165,7 +165,7 @@ class FetchWebTool:
 class DockerSandboxTool:
     """Execute commands in a Docker sandbox for safe exploration of external directories"""
 
-    DEFAULT_IMAGE = "python:3.11-slim"
+    DEFAULT_IMAGE = "python:slim"
 
     def __init__(self, confirm_callback=None):
         self.containers = {}  # {mount_path: container_id}
@@ -215,7 +215,7 @@ Examples:
                     },
                     "image": {
                         "type": "string",
-                        "description": "Docker image to use (default: python:3.11-slim)"
+                        "description": "Docker image to use (default: python:slim)"
                     }
                 },
                 "required": ["action"]
@@ -272,7 +272,7 @@ Examples:
             result = subprocess.run(
                 [
                     "docker", "run", "-d", "--rm",
-                    "-v", f"{docker_path}:/workspace:ro",
+                    "-v", f"{docker_path}:/workspace",
                     "-w", "/workspace",
                     image,
                     "tail", "-f", "/dev/null"  # Keep container running
