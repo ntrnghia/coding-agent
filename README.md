@@ -89,7 +89,7 @@ Safely explore external directories in isolated Docker containers:
 - Mounts directories at `/workspace` with read-write access
 - Containers persist across prompts (no restart needed)
 - Multiple directories can be mounted simultaneously
-- Uses `python:3.11-slim` image by default
+- Uses `python:slim` image by default
 
 ## Context Management
 
