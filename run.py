@@ -117,6 +117,11 @@ def parse_debug_file(filepath):
                     messages.append({"role": "assistant", "content": assistant_content})
                     last_assistant_content = assistant_content
                     
+                    # Extract thinking indicator for display
+                    for b in assistant_content:
+                        if b.get("type") == "thinking":
+                            display_history.append(("thinking", "🧠 Thinking..."))
+                    
                     # Extract text for display
                     texts = [b["text"] for b in assistant_content if b.get("type") == "text"]
                     if texts:
@@ -181,6 +186,8 @@ def replay_display_history(display_history):
     for role, content in display_history:
         if role == "user":
             print(f"{Fore.CYAN}You:{Style.RESET_ALL} {content}")
+        elif role == "thinking":
+            print(f"{Fore.MAGENTA}{content}{Style.RESET_ALL}")
         elif role == "assistant":
             print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {content}")
         elif role == "tool":

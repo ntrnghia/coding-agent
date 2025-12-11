@@ -857,6 +857,8 @@ Always verify your actions and explain what you're doing."""
                     if hasattr(block, 'signature') and block.signature:
                         thinking_block["signature"] = block.signature
                     content_list.append(thinking_block)
+                    # Add to display history for resume
+                    self.display_history.append(("thinking", "🧠 Thinking..."))
                     # Print indicator if not streaming (streaming already showed it)
                     if not self.stream:
                         print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
