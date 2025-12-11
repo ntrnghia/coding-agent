@@ -17,6 +17,7 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Auto-compact**: Automatically summarizes context when approaching token limit
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
+- **Prompt caching**: System prompt and tools are cached to reduce rate limit usage
 - **Streaming output**: Real-time response display with `-s` flag
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
 
