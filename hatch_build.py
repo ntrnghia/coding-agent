@@ -1,29 +1,29 @@
 """Custom hatch build hook for git-based versioning."""
-import os
 import subprocess
 from pathlib import Path
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-# Base commit: "Convert to pip package" - this is version 0.1.0
-BASE_COMMIT = "5d77a0a"
+# Base: parent of first 0.2.x commit (so 0.2.0 = 1 commit after this)
+BASE_COMMIT = "22edcfe"
+BASE_MINOR = 2
+BASE_OFFSET = -1  # Subtract 1 so first commit is 0.2.0
 
 def get_version():
     """Calculate version from git commit count since base.
     
-    Formula: 0.{1 + commits//10}.{commits%10}
-    - 0 commits → 0.1.0
-    - 1 commit  → 0.1.1
-    - 10 commits → 0.2.0
-    - 15 commits → 0.2.5
+    Formula: 0.{BASE_MINOR + (count+offset)//10}.{(count+offset)%10}
+    - 1 commit after base → 0.2.0
+    - 2 commits → 0.2.1
+    - 11 commits → 0.3.0
     """
     try:
         count = int(subprocess.check_output(
             ["git", "rev-list", "--count", f"{BASE_COMMIT}..HEAD"],
             stderr=subprocess.DEVNULL, text=True
-        ).strip())
-        return f"0.{1 + count // 10}.{count % 10}"
+        ).strip()) + BASE_OFFSET
+        return f"0.{BASE_MINOR + count // 10}.{count % 10}"
     except Exception:
-        return "0.1.0"
+        return "0.2.0"
 
 class CustomBuildHook(BuildHookInterface):
     """Build hook that generates _version.py."""
