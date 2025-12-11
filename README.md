@@ -19,6 +19,7 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
 - **Prompt caching**: System prompt and tools are cached to reduce rate limit usage
 - **Streaming output**: Real-time response display (always enabled)
+- **Cost tracking**: Shows per-request and session costs with token usage
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
 
 ## Installation
@@ -73,7 +74,6 @@ ntn -t
 Combine flags:
 ```bash
 ntn -t -r  # Resume with extended thinking
-ntn -s -r  # Resume with streaming
 ```
 
 Alternative: Run as Python module:
