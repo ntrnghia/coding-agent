@@ -1,6 +1,6 @@
 """NTN - Minimal AI coding agent powered by Claude"""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "NTN"
 
 from .agent import CodingAgent, ContainerManager, print_divider

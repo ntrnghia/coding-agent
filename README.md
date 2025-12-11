@@ -30,7 +30,7 @@ pip install ntn
 
 Or install from source:
 ```bash
-git clone https://github.com/yourusername/ntn.git
+git clone https://github.com/ntrnghia/coding-agent.git
 cd ntn
 pip install -e .
 ```
