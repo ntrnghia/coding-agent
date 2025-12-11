@@ -11,6 +11,14 @@ from tools import get_tool_description
 # Initialize colorama
 init(autoreset=True)
 
+# UI constants
+DIVIDER_WIDTH = 80
+DIVIDER_LINE = '─' * DIVIDER_WIDTH
+
+def print_divider():
+    """Print a horizontal divider line"""
+    print(f"{Style.DIM}{DIVIDER_LINE}{Style.RESET_ALL}")
+
 
 class ContainerManager:
     """Manages a persistent Docker container for the agent session"""
@@ -829,8 +837,7 @@ Always verify your actions and explain what you're doing."""
     
     def print_status(self):
         """Print rate limit and context usage status with visual separator (call before user input)"""
-        box_width = 80
-        inner_width = box_width - 2  # Account for side borders
+        inner_width = DIVIDER_WIDTH - 2  # Account for side borders
         
         # Input rate limit
         if self.rate_limit_info and self.rate_limit_info.get("input_limit") and self.rate_limit_info.get("input_remaining") is not None:
@@ -861,7 +868,7 @@ Always verify your actions and explain what you're doing."""
         
         # Print separator and box
         print()  # Blank line for spacing
-        print(f"{Style.DIM}{'─' * box_width}{Style.RESET_ALL}")
+        print_divider()
         print(f"{Style.DIM}╭{'─' * inner_width}╮{Style.RESET_ALL}")
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {rate_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {context_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")

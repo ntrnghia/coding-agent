@@ -11,7 +11,7 @@ from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
 from tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
-from agent import CodingAgent
+from agent import CodingAgent, print_divider
 
 # Initialize colorama
 init(autoreset=True)
@@ -183,8 +183,15 @@ def parse_container_info(filepath):
 
 def replay_display_history(display_history):
     """Print the conversation history for resume"""
+    is_first_user = True
     for role, content in display_history:
         if role == "user":
+            # Print divider before each user message (except first)
+            if not is_first_user:
+                print()
+                print_divider()
+                print()
+            is_first_user = False
             print(f"{Fore.CYAN}You:{Style.RESET_ALL} {content}")
         elif role == "thinking":
             print(f"{Fore.MAGENTA}{content}{Style.RESET_ALL}")
