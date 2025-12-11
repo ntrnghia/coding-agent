@@ -169,8 +169,8 @@ def parse_container_info(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Find the last CONTAINER INFO block
-    matches = list(re.finditer(r'=== CONTAINER INFO ===\n(.*?)(?=\n===|$)', content, re.DOTALL))
+    # Find all CONTAINER INFO blocks - capture only the next line (the JSON)
+    matches = list(re.finditer(r'=== CONTAINER INFO ===\n(.+)', content))
     
     if matches:
         try:
