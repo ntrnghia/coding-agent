@@ -322,6 +322,9 @@ def main():
 
     try:
         while True:
+            # Print status before user input (skip on first run)
+            agent.print_status()
+            
             try:
                 user_input = prompt(
                     [('class:prompt', 'You: ')],

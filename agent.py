@@ -255,6 +255,10 @@ Provide your response in this format:
         # Extended thinking budget (min 1024, we use 16K for good reasoning)
         self.thinking_budget = 64000 - 1
         
+        # Rate limit tracking (populated after first API call)
+        self.rate_limit_info = None  # Will store input/output limits and remaining
+        self.context_tokens = 0  # Current context size from last response
+        
         # Setup debug log file and container
         if debug_file:
             # Resume: use existing debug file
@@ -688,6 +692,9 @@ Always verify your actions and explain what you're doing."""
                 print(f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}")
                 time.sleep(delay)
 
+        # Capture rate limit info from response headers
+        self._capture_rate_limit_info(response)
+        
         # Convert response.content to serializable format for storage
         content_list = self._response_to_content_list(response, print_text)
         return response, content_list
@@ -780,7 +787,73 @@ Always verify your actions and explain what you're doing."""
             # Get final response for stop_reason
             final_response = stream.get_final_message()
         
+        # Capture rate limit info from streaming response headers
+        if hasattr(stream, 'response') and stream.response:
+            self._capture_rate_limit_info_from_headers(stream.response.headers, final_response)
+        
         return final_response, content_list
+    
+    def _capture_rate_limit_info(self, response):
+        """Capture rate limit info from API response headers and usage"""
+        # Get headers from the HTTP response
+        if hasattr(response, '_raw_response') and response._raw_response:
+            headers = response._raw_response.headers
+        else:
+            headers = {}
+        
+        self._capture_rate_limit_info_from_headers(headers, response)
+    
+    def _capture_rate_limit_info_from_headers(self, headers, response):
+        """Extract rate limit info from headers dict and response usage"""
+        def get_int(key):
+            val = headers.get(key)
+            return int(val) if val else None
+        
+        self.rate_limit_info = {
+            "input_limit": get_int("anthropic-ratelimit-input-tokens-limit"),
+            "input_remaining": get_int("anthropic-ratelimit-input-tokens-remaining"),
+            "output_limit": get_int("anthropic-ratelimit-output-tokens-limit"),
+            "output_remaining": get_int("anthropic-ratelimit-output-tokens-remaining"),
+        }
+        
+        # Track context usage from response
+        if hasattr(response, 'usage'):
+            usage = response.usage
+            # Total context = all input tokens used
+            input_tokens = getattr(usage, 'input_tokens', 0) or 0
+            cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+            cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+            output_tokens = getattr(usage, 'output_tokens', 0) or 0
+            
+            # Context is total tokens in conversation history
+            self.context_tokens = input_tokens + cache_creation + cache_read + output_tokens
+    
+    def print_status(self):
+        """Print rate limit and context usage status (call before user input)"""
+        if self.rate_limit_info is None:
+            return  # Skip until after first API call
+        
+        rl = self.rate_limit_info
+        
+        # Input rate limit
+        if rl.get("input_limit") and rl.get("input_remaining") is not None:
+            input_pct = (rl["input_remaining"] / rl["input_limit"]) * 100
+            input_str = f"{rl['input_remaining']:,}/{rl['input_limit']:,} ({input_pct:.0f}%)"
+        else:
+            input_str = "N/A"
+        
+        # Output rate limit
+        if rl.get("output_limit") and rl.get("output_remaining") is not None:
+            output_pct = (rl["output_remaining"] / rl["output_limit"]) * 100
+            output_str = f"{rl['output_remaining']:,}/{rl['output_limit']:,} ({output_pct:.0f}%)"
+        else:
+            output_str = "N/A"
+        
+        # Context usage
+        context_pct = (self.context_tokens / self.MAX_CONTEXT_TOKENS) * 100
+        context_str = f"{self.context_tokens:,}/{self.MAX_CONTEXT_TOKENS:,} ({context_pct:.0f}%)"
+        
+        print(f"{Fore.CYAN}ratelimit: input: {input_str}, output: {output_str}; context: {context_str}{Style.RESET_ALL}")
     
     def _response_to_content_list(self, response, print_text=True):
         """Convert response.content to serializable format and optionally print text."""
