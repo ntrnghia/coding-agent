@@ -829,11 +829,13 @@ Always verify your actions and explain what you're doing."""
             self.context_tokens = input_tokens + cache_creation + cache_read + output_tokens
     
     def print_status(self):
-        """Print rate limit and context usage status (call before user input)"""
+        """Print rate limit and context usage status with visual separator (call before user input)"""
         if self.rate_limit_info is None:
             return  # Skip until after first API call
         
         rl = self.rate_limit_info
+        box_width = 80
+        inner_width = box_width - 2  # Account for side borders
         
         # Input rate limit
         if rl.get("input_limit") and rl.get("input_remaining") is not None:
@@ -853,7 +855,17 @@ Always verify your actions and explain what you're doing."""
         context_pct = (self.context_tokens / self.MAX_CONTEXT_TOKENS) * 100
         context_str = f"{self.context_tokens:,}/{self.MAX_CONTEXT_TOKENS:,} ({context_pct:.0f}%)"
         
-        print(f"{Fore.CYAN}ratelimit: input: {input_str}, output: {output_str}; context: {context_str}{Style.RESET_ALL}")
+        # Build content lines
+        rate_line = f"ratelimit: input: {input_str}, output: {output_str}"
+        context_line = f"context: {context_str}"
+        
+        # Print separator and box
+        print()  # Blank line for spacing
+        print(f"{Style.DIM}{'─' * box_width}{Style.RESET_ALL}")
+        print(f"{Style.DIM}╭{'─' * inner_width}╮{Style.RESET_ALL}")
+        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {rate_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
+        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {context_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
+        print(f"{Style.DIM}╰{'─' * inner_width}╯{Style.RESET_ALL}")
     
     def _response_to_content_list(self, response, print_text=True):
         """Convert response.content to serializable format and optionally print text."""
