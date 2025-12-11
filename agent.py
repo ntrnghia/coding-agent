@@ -830,28 +830,29 @@ Always verify your actions and explain what you're doing."""
     
     def print_status(self):
         """Print rate limit and context usage status with visual separator (call before user input)"""
-        if self.rate_limit_info is None:
-            return  # Skip until after first API call
-        
-        rl = self.rate_limit_info
         box_width = 80
         inner_width = box_width - 2  # Account for side borders
         
         # Input rate limit
-        if rl.get("input_limit") and rl.get("input_remaining") is not None:
+        if self.rate_limit_info and self.rate_limit_info.get("input_limit") and self.rate_limit_info.get("input_remaining") is not None:
+            rl = self.rate_limit_info
             input_pct = (rl["input_remaining"] / rl["input_limit"]) * 100
             input_str = f"{rl['input_remaining']:,}/{rl['input_limit']:,} ({input_pct:.0f}%)"
         else:
             input_str = "N/A"
         
         # Output rate limit
-        if rl.get("output_limit") and rl.get("output_remaining") is not None:
+        if self.rate_limit_info and self.rate_limit_info.get("output_limit") and self.rate_limit_info.get("output_remaining") is not None:
+            rl = self.rate_limit_info
             output_pct = (rl["output_remaining"] / rl["output_limit"]) * 100
             output_str = f"{rl['output_remaining']:,}/{rl['output_limit']:,} ({output_pct:.0f}%)"
         else:
             output_str = "N/A"
         
-        # Context usage
+        # Context usage - estimate from messages if not yet set
+        if self.context_tokens == 0 and self.messages:
+            self.context_tokens = self._count_tokens(self.messages)
+        
         context_pct = (self.context_tokens / self.MAX_CONTEXT_TOKENS) * 100
         context_str = f"{self.context_tokens:,}/{self.MAX_CONTEXT_TOKENS:,} ({context_pct:.0f}%)"
         
