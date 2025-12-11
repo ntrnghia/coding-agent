@@ -198,6 +198,16 @@ def parse_arguments():
         metavar='DEBUG_FILE',
         help='Resume from a debug file. If no file specified, uses the most recent.'
     )
+    parser.add_argument(
+        '-t', '--think',
+        action='store_true',
+        help='Enable extended thinking for complex reasoning tasks'
+    )
+    parser.add_argument(
+        '-s', '--stream',
+        action='store_true',
+        help='Enable streaming output for real-time response display'
+    )
     return parser.parse_args()
 
 
@@ -258,7 +268,9 @@ def main():
         tools=[terminal, web_search, fetch_web, docker_sandbox],
         workspace_dir=workspace,
         debug_file=resume_file,  # None for new session, path for resume
-        container_info=container_info  # None for new session, dict for resume
+        container_info=container_info,  # None for new session, dict for resume
+        stream=args.stream,
+        think=args.think
     )
     
     # Wire up DockerSandboxTool with agent reference
@@ -281,6 +293,16 @@ def main():
         print(f"{Fore.GREEN}Coding Agent initialized in: {workspace}")
     print(f"{Fore.CYAN}Debug logs: {agent.debug_file}")
     print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
+    
+    # Show enabled features
+    features = []
+    if args.stream:
+        features.append("streaming")
+    if args.think:
+        features.append("extended thinking")
+    if features:
+        print(f"{Fore.CYAN}Features: {', '.join(features)}")
+    
     print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit\n")
 
     # If resuming with incomplete turn, continue it first
@@ -311,6 +333,7 @@ def main():
                 agent.run(user_input)
             except KeyboardInterrupt:
                 print(f"\n{Fore.YELLOW}Interrupted by user")
+                agent._log_end_turn()  # Mark turn as intentionally stopped
             except Exception as e:
                 print(f"{Fore.RED}Error: {e}")
                 import traceback

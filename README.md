@@ -17,6 +17,8 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Auto-compact**: Automatically summarizes context when approaching token limit
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
+- **Streaming output**: Real-time response display with `-s` flag
+- **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
 
 ## Setup
 
@@ -52,6 +54,22 @@ python run.py -r
 
 # Resume specific session
 python run.py -r debug/debug_20251210_120000.txt
+```
+
+Enable streaming output (real-time text display):
+```bash
+python run.py -s
+```
+
+Enable extended thinking (better for complex reasoning):
+```bash
+python run.py -t
+```
+
+Combine flags:
+```bash
+python run.py -s -t  # Streaming with extended thinking
+python run.py -s -r  # Resume with streaming
 ```
 
 **Input controls:**

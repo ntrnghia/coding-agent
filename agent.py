@@ -212,7 +212,7 @@ class CodingAgent:
     
     # Context limits for claude-opus-4-5-20251101
     MAX_CONTEXT_TOKENS = 200000
-    MAX_OUTPUT_TOKENS = 8192  # Conservative output limit
+    MAX_OUTPUT_TOKENS = 64000  # Conservative output limit
     
     # Summarization request template
     SUMMARIZATION_TEMPLATE = """Summarize the conversation above into a concise context, then answer the current question.
@@ -239,7 +239,7 @@ Provide your response in this format:
 (Your answer to the current question)
 [/ANSWER]"""
 
-    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None):
+    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None, stream=False, think=False):
         self.client = anthropic.Anthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY")
         )
@@ -249,6 +249,11 @@ Provide your response in this format:
         self.tools = tools
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
         self.display_history = []  # Store original user inputs for resume display
+        self.stream = stream  # Enable streaming output
+        self.think = think  # Enable extended thinking
+        
+        # Extended thinking budget (min 1024, we use 16K for good reasoning)
+        self.thinking_budget = 64000 - 1
         
         # Setup debug log file and container
         if debug_file:
@@ -613,26 +618,44 @@ Always verify your actions and explain what you're doing."""
         self.messages.append({"role": "assistant", "content": content_list})
         return response
     
-    def _call_api(self):
+    def _call_api(self, print_text=True):
         """Call Claude API with current messages. Does NOT modify self.messages.
         
         Implements retry using retry-after header for rate limit errors.
+        Supports streaming and extended thinking based on instance flags.
+        
+        Args:
+            print_text: Whether to print text responses (True for run(), False for chat())
         
         Returns:
             tuple: (response, content_list) where content_list is serializable format
         """
         max_retries = 3
         
+        # Build API kwargs
+        api_kwargs = {
+            "model": self.model,
+            "max_tokens": self.MAX_OUTPUT_TOKENS,
+            "system": self.system_message,
+            "tools": self._get_tool_schemas(),
+            "messages": self.messages
+        }
+        
+        # Add extended thinking if enabled
+        if self.think:
+            api_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget
+            }
+            # Extended thinking requires temperature=1 (default, so we don't set it)
+        
         for attempt in range(max_retries + 1):
             try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.MAX_OUTPUT_TOKENS,
-                    system=self.system_message,
-                    tools=self._get_tool_schemas(),
-                    messages=self.messages
-                )
-                break  # Success, exit retry loop
+                if self.stream:
+                    return self._call_api_streaming(api_kwargs, print_text)
+                else:
+                    response = self.client.messages.create(**api_kwargs)
+                    break  # Success, exit retry loop
             except anthropic.RateLimitError as e:
                 if attempt == max_retries:
                     print(f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}")
@@ -646,9 +669,112 @@ Always verify your actions and explain what you're doing."""
                 time.sleep(delay)
 
         # Convert response.content to serializable format for storage
+        content_list = self._response_to_content_list(response, print_text)
+        return response, content_list
+    
+    def _call_api_streaming(self, api_kwargs, print_text=True):
+        """Handle streaming API call with real-time text output.
+        
+        Text is streamed character-by-character.
+        Tool use blocks are accumulated and shown when complete.
+        Thinking blocks just show "🧠 Thinking..." indicator.
+        """
+        content_list = []
+        current_text = ""
+        current_thinking = ""  # Accumulate thinking content
+        current_thinking_signature = ""  # Accumulate signature
+        current_tool_use = None
+        tool_input_json = ""
+        thinking_shown = False
+        text_started = False
+        
+        with self.client.messages.stream(**api_kwargs) as stream:
+            for event in stream:
+                # Handle different event types
+                if event.type == "content_block_start":
+                    if hasattr(event.content_block, 'type'):
+                        if event.content_block.type == "thinking":
+                            current_thinking = ""  # Start new thinking block
+                            current_thinking_signature = ""
+                            if not thinking_shown and print_text:
+                                print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
+                                thinking_shown = True
+                        elif event.content_block.type == "text":
+                            if print_text:
+                                print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} ", end="", flush=True)
+                            text_started = True
+                        elif event.content_block.type == "tool_use":
+                            current_tool_use = {
+                                "id": event.content_block.id,
+                                "name": event.content_block.name,
+                                "input": {}
+                            }
+                            tool_input_json = ""
+                
+                elif event.type == "content_block_delta":
+                    if hasattr(event.delta, 'type'):
+                        if event.delta.type == "thinking_delta":
+                            # Accumulate thinking content (don't print)
+                            current_thinking += event.delta.thinking
+                        elif event.delta.type == "signature_delta":
+                            # Capture the signature for the thinking block
+                            current_thinking_signature += event.delta.signature
+                        elif event.delta.type == "text_delta":
+                            text = event.delta.text
+                            current_text += text
+                            if print_text:
+                                print(text, end="", flush=True)
+                        elif event.delta.type == "input_json_delta":
+                            tool_input_json += event.delta.partial_json
+                
+                elif event.type == "content_block_stop":
+                    # Store thinking block if we accumulated any (with signature)
+                    if current_thinking or current_thinking_signature:
+                        thinking_block = {"type": "thinking", "thinking": current_thinking}
+                        if current_thinking_signature:
+                            thinking_block["signature"] = current_thinking_signature
+                        content_list.append(thinking_block)
+                        current_thinking = ""
+                        current_thinking_signature = ""
+                    if current_text:
+                        content_list.append({"type": "text", "text": current_text})
+                        if print_text and text_started:
+                            print()  # New line after text
+                        current_text = ""
+                        text_started = False
+                    if current_tool_use:
+                        # Parse accumulated JSON
+                        try:
+                            current_tool_use["input"] = json.loads(tool_input_json) if tool_input_json else {}
+                        except json.JSONDecodeError:
+                            current_tool_use["input"] = {}
+                        content_list.append({
+                            "type": "tool_use",
+                            "id": current_tool_use["id"],
+                            "name": current_tool_use["name"],
+                            "input": current_tool_use["input"]
+                        })
+                        current_tool_use = None
+                        tool_input_json = ""
+            
+            # Get final response for stop_reason
+            final_response = stream.get_final_message()
+        
+        return final_response, content_list
+    
+    def _response_to_content_list(self, response, print_text=True):
+        """Convert response.content to serializable format and optionally print text."""
         content_list = []
         for block in response.content:
-            if hasattr(block, 'text'):
+            if block.type == "thinking":
+                # Store thinking block with signature for resume capability
+                thinking_block = {"type": "thinking", "thinking": block.thinking}
+                if hasattr(block, 'signature') and block.signature:
+                    thinking_block["signature"] = block.signature
+                content_list.append(thinking_block)
+                if print_text:
+                    print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
+            elif hasattr(block, 'text'):
                 content_list.append({"type": "text", "text": block.text})
             elif block.type == "tool_use":
                 content_list.append({
@@ -657,8 +783,25 @@ Always verify your actions and explain what you're doing."""
                     "name": block.name,
                     "input": block.input
                 })
-
-        return response, content_list
+        return content_list
+    
+    def _ensure_thinking_blocks(self):
+        """Ensure thinking blocks are valid for API submission.
+        
+        When resuming with thinking enabled, thinking blocks must have valid signatures.
+        This method removes any thinking blocks that lack signatures (from old non-thinking
+        sessions or corrupted data). The API accepts messages without thinking blocks
+        for non-tool-result user messages.
+        """
+        for msg in self.messages:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    # Filter out thinking blocks without valid signatures
+                    msg["content"] = [
+                        block for block in content
+                        if block.get("type") != "thinking" or block.get("signature")
+                    ]
 
     def run(self, user_input, max_turns=100, initial_messages=None, display_history=None):
         """Main agent loop
@@ -677,6 +820,10 @@ Always verify your actions and explain what you're doing."""
         
         # Store original user input for display history
         self.display_history.append(("user", user_input))
+        
+        # If thinking is enabled, ensure all assistant messages have thinking blocks
+        if self.think and self.messages:
+            self._ensure_thinking_blocks()
         
         # Check and compact if needed before processing
         if self.messages:  # Only check if we have existing messages
@@ -700,12 +847,24 @@ Always verify your actions and explain what you're doing."""
             response = self.chat(current_input)
 
             # Convert response to serializable format and log immediately
+            # Note: _call_api already handles printing when streaming is enabled
             content_list = []
             agent_texts = []
             for block in response.content:
-                if hasattr(block, 'text'):
+                if block.type == "thinking":
+                    # Store thinking block with signature for resume capability
+                    thinking_block = {"type": "thinking", "thinking": block.thinking}
+                    if hasattr(block, 'signature') and block.signature:
+                        thinking_block["signature"] = block.signature
+                    content_list.append(thinking_block)
+                    # Print indicator if not streaming (streaming already showed it)
+                    if not self.stream:
+                        print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
+                elif hasattr(block, 'text'):
                     content_list.append({"type": "text", "text": block.text})
-                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
+                    # Only print if not streaming (streaming already printed)
+                    if not self.stream:
+                        print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
                     agent_texts.append(block.text)
                 elif block.type == "tool_use":
                     content_list.append({
@@ -809,6 +968,10 @@ Always verify your actions and explain what you're doing."""
             print(f"{Fore.RED}Unknown incomplete turn type: {incomplete_turn['type']}{Style.RESET_ALL}")
             return None
         
+        # If thinking is enabled, ensure all assistant messages have thinking blocks
+        if self.think:
+            self._ensure_thinking_blocks()
+        
         # Continue the agent loop - call API with current messages
         for i in range(max_turns):
             # Call API without modifying messages first (they're already set up)
@@ -817,10 +980,11 @@ Always verify your actions and explain what you're doing."""
             # Add assistant response to messages
             self.messages.append({"role": "assistant", "content": content_list})
             
-            # Extract text and log
+            # Extract text and log (only print if not streaming)
             agent_texts = [b["text"] for b in content_list if b.get("type") == "text"]
-            for text in agent_texts:
-                print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
+            if not self.stream:
+                for text in agent_texts:
+                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
             
             # Log assistant response immediately
             self._log_assistant(content_list)
