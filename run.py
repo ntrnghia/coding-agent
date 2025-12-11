@@ -317,7 +317,7 @@ def main():
     if features:
         print(f"{Fore.CYAN}Features: {', '.join(features)}")
     
-    print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit\n")
+    print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit")
 
     # If resuming with incomplete turn, continue it first
     if incomplete_turn:

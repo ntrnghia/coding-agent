@@ -12,7 +12,7 @@ def get_tool_description(tool_name, tool_input):
         action = tool_input.get("action", "")
         if action == "start":
             path = tool_input.get("mount_path", "")
-            return f"🐳 Start container: {path}"
+            return f"🐳 Mount directory: {path}"
         elif action == "exec":
             cmd = tool_input.get("command", "")
             return _parse_exec_command(cmd)

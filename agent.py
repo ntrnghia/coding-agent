@@ -386,7 +386,6 @@ Always verify your actions and explain what you're doing."""
         
         # Need to restart container with new mount
         if self.container_manager.container_running():
-            print(f"{Fore.YELLOW}🔄 Restarting container to add new mount...{Style.RESET_ALL}")
             result = self.container_manager.restart_with_new_mounts()
         else:
             result = self.container_manager.start()
