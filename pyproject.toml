@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ntn"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Minimal AI coding agent powered by Claude"
 readme = "README.md"
 license = "MIT"
@@ -59,3 +59,11 @@ include = [
     "/README.md",
     "/LICENSE",
 ]
+
+[tool.hatch.version]
+source = "code"
+path = "hatch_build.py"
+expression = "get_version()"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"

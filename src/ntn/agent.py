@@ -215,6 +215,12 @@ class CodingAgent:
     MAX_CONTEXT_TOKENS = 200000
     MAX_OUTPUT_TOKENS = 64000  # Conservative output limit
     
+    # Pricing per 1M tokens (USD) - update when changing models
+    MODEL_PRICING = {
+        "claude-opus-4-5-20251101": {"input": 5, "output": 25, "cache_write": 6.25, "cache_read": 0.50},
+        "claude-sonnet-4-20250514": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
+    }
+    
     # Summarization request template
     SUMMARIZATION_TEMPLATE = """Summarize the conversation above into a concise context, then answer the current question.
 
@@ -257,8 +263,14 @@ Provide your response in this format:
         self.thinking_budget = 64000 - 1
         
         # Rate limit tracking (populated after first API call)
-        self.rate_limit_info = None  # Will store input/output limits and remaining
+        self.rate_limit_info = None  # Will store input/output/request limits and remaining
         self.context_tokens = 0  # Current context size from last response
+        
+        # Cost tracking
+        self.session_cost = 0.0  # Total cost of entire conversation (including before resume)
+        self.run_cost = 0.0  # Cost since current run started (resets on resume)
+        self.last_req_cost = 0.0  # Cost of last API request
+        self.last_usage = None  # Last API usage tokens (for logging)
         
         # Setup debug log file and container
         if debug_file:
@@ -459,6 +471,11 @@ Always verify your actions and explain what you're doing."""
         """Log assistant response immediately after API call"""
         self._log_raw(f"\n--- ASSISTANT ---")
         self._log_raw(json.dumps(content_list, indent=2, ensure_ascii=False))
+
+    def _log_req_cost(self):
+        """Log request usage tokens immediately after API call (for cost calculation on resume)"""
+        if self.last_usage:
+            self._log_raw(f"--- USAGE: {json.dumps(self.last_usage)} ---")
 
     def _log_tool_results(self, tool_results):
         """Log tool results immediately after execution"""
@@ -807,19 +824,21 @@ Always verify your actions and explain what you're doing."""
         self._capture_rate_limit_info_from_headers(headers, response)
     
     def _capture_rate_limit_info_from_headers(self, headers, response):
-        """Extract rate limit info from headers dict and response usage"""
+        """Extract rate limit info from headers dict and response usage, calculate cost"""
         def get_int(key):
             val = headers.get(key)
             return int(val) if val else None
         
         self.rate_limit_info = {
+            "request_limit": get_int("anthropic-ratelimit-requests-limit"),
+            "request_remaining": get_int("anthropic-ratelimit-requests-remaining"),
             "input_limit": get_int("anthropic-ratelimit-input-tokens-limit"),
             "input_remaining": get_int("anthropic-ratelimit-input-tokens-remaining"),
             "output_limit": get_int("anthropic-ratelimit-output-tokens-limit"),
             "output_remaining": get_int("anthropic-ratelimit-output-tokens-remaining"),
         }
         
-        # Track context usage from response
+        # Track context usage and calculate cost from response
         if hasattr(response, 'usage'):
             usage = response.usage
             # Total context = all input tokens used (not output - that has separate limit)
@@ -829,45 +848,84 @@ Always verify your actions and explain what you're doing."""
             
             # Context is total input tokens (what counts toward 200K limit)
             self.context_tokens = input_tokens + cache_creation + cache_read
+            
+            # Calculate cost
+            self._calculate_cost(usage)
+    
+    @staticmethod
+    def calculate_cost_from_usage(usage, model="claude-opus-4-5-20251101"):
+        """Calculate cost from usage dict. Usage keys: input, output, cache_write, cache_read"""
+        pricing = CodingAgent.MODEL_PRICING.get(model, {})
+        if not pricing:
+            return 0.0
+        return sum(usage.get(k, 0) * pricing.get(k, 0) / 1_000_000 for k in pricing)
+    
+    def _calculate_cost(self, usage):
+        """Calculate cost from API usage and update session totals"""
+        self.last_usage = {
+            "input": getattr(usage, 'input_tokens', 0) or 0,
+            "output": getattr(usage, 'output_tokens', 0) or 0,
+            "cache_write": getattr(usage, 'cache_creation_input_tokens', 0) or 0,
+            "cache_read": getattr(usage, 'cache_read_input_tokens', 0) or 0
+        }
+        self.last_req_cost = self.calculate_cost_from_usage(self.last_usage, self.model)
+        self.run_cost += self.last_req_cost
+        self.session_cost += self.last_req_cost
+    
+    def _format_token_count(self, count):
+        """Format token count with K suffix for large numbers"""
+        if count >= 1000:
+            return f"{count/1000:.0f}K"
+        return str(count)
     
     def print_status(self):
-        """Print rate limit and context usage status with visual separator (call before user input)"""
+        """Print rate limit, cost, and context usage status with visual separator"""
         inner_width = DIVIDER_WIDTH - 2  # Account for side borders
         
-        # Input rate limit (show used/limit)
+        # Cost line: run_cost = since this run started, session_cost = total conversation
+        cost_line = f"💰 Cost: ${self.run_cost:.4f} (total: ${self.session_cost:.4f})"
+        
+        # Requests rate limit
+        if self.rate_limit_info and self.rate_limit_info.get("request_limit") and self.rate_limit_info.get("request_remaining") is not None:
+            rl = self.rate_limit_info
+            req_used = rl["request_limit"] - rl["request_remaining"]
+            req_pct = (req_used / rl["request_limit"]) * 100
+            req_str = f"{req_used}/{rl['request_limit']} ({req_pct:.0f}%)"
+        else:
+            req_str = "N/A"
+        
+        # Input rate limit (show used/limit with K suffix)
         if self.rate_limit_info and self.rate_limit_info.get("input_limit") and self.rate_limit_info.get("input_remaining") is not None:
             rl = self.rate_limit_info
             input_used = rl["input_limit"] - rl["input_remaining"]
             input_pct = (input_used / rl["input_limit"]) * 100
-            input_str = f"{input_used:,}/{rl['input_limit']:,} ({input_pct:.0f}%)"
+            input_str = f"{self._format_token_count(input_used)}/{self._format_token_count(rl['input_limit'])} ({input_pct:.0f}%)"
         else:
             input_str = "N/A"
         
-        # Output rate limit (show used/limit)
+        # Output rate limit (show used/limit with K suffix)
         if self.rate_limit_info and self.rate_limit_info.get("output_limit") and self.rate_limit_info.get("output_remaining") is not None:
             rl = self.rate_limit_info
             output_used = rl["output_limit"] - rl["output_remaining"]
             output_pct = (output_used / rl["output_limit"]) * 100
-            output_str = f"{output_used:,}/{rl['output_limit']:,} ({output_pct:.0f}%)"
+            output_str = f"{self._format_token_count(output_used)}/{self._format_token_count(rl['output_limit'])} ({output_pct:.0f}%)"
         else:
             output_str = "N/A"
         
+        rate_line = f"📊 Requests: {req_str} | Input: {input_str} | Output: {output_str}"
+        
         # Context usage - always calculate current tokens for accurate display
-        # (API usage shows tokens at call time, but messages grow after response is added)
         if self.messages:
             self.context_tokens = self._count_tokens(self.messages)
         
         context_pct = (self.context_tokens / self.MAX_CONTEXT_TOKENS) * 100
-        context_str = f"{self.context_tokens:,}/{self.MAX_CONTEXT_TOKENS:,} ({context_pct:.0f}%)"
-        
-        # Build content lines
-        rate_line = f"ratelimit: input: {input_str}, output: {output_str}"
-        context_line = f"context: {context_str}"
+        context_line = f"🧠 Context: {self.context_tokens:,}/{self.MAX_CONTEXT_TOKENS:,} ({context_pct:.0f}%)"
         
         # Print separator and box
         print()  # Blank line for spacing
         print_divider()
         print(f"{Style.DIM}╭{'─' * inner_width}╮{Style.RESET_ALL}")
+        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {cost_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {rate_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {context_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}╰{'─' * inner_width}╯{Style.RESET_ALL}")
@@ -1025,6 +1083,7 @@ Always verify your actions and explain what you're doing."""
             
             # Log and process response
             self._log_assistant(content_list)
+            self._log_req_cost()
             agent_texts = self._process_response(response, content_list)
             
             if response.stop_reason == "tool_use":

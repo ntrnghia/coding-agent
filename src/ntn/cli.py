@@ -71,17 +71,19 @@ def find_latest_debug_file(workspace):
 
 
 def parse_debug_file(filepath):
-    """Parse debug file with incremental format to extract messages and display history
+    """Parse debug file with incremental format to extract messages, display history, and session cost
     
     New format uses:
     - --- USER --- : User input (first one is text, subsequent are in TOOL_RESULT)
     - --- ASSISTANT --- : Assistant response (JSON array)
+    - --- REQ_COST: X.XXXXXX --- : Cost of the request
     - --- TOOL_RESULT --- : Tool execution results
     - --- END_TURN --- : Marks turn completion
     
     Returns:
-        tuple: (messages, display_history, incomplete_turn) 
+        tuple: (messages, display_history, incomplete_turn, session_cost) 
                incomplete_turn is the pending input to continue from, or None if complete
+               session_cost is calculated from USAGE tokens or legacy REQ_COST values
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -89,6 +91,22 @@ def parse_debug_file(filepath):
     messages = []
     display_history = []
     incomplete_turn = None
+    session_cost = 0.0
+    
+    # Parse USAGE lines (new format) and calculate cost
+    for usage_str in re.findall(r'--- USAGE: ({.*?}) ---', content):
+        try:
+            session_cost += CodingAgent.calculate_cost_from_usage(json.loads(usage_str))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    
+    # Fallback: Parse legacy REQ_COST lines (old format)
+    if session_cost == 0.0:
+        for cost_str in re.findall(r'--- REQ_COST: ([\d.]+) ---', content):
+            try:
+                session_cost += float(cost_str)
+            except ValueError:
+                pass
     
     # Split by turn markers
     turn_splits = re.split(r'\n=== TURN \d+ ===\n', content)
@@ -162,7 +180,7 @@ def parse_debug_file(filepath):
                 # Need to call API to get response
                 incomplete_turn = {"type": "continue"}
     
-    return messages, display_history, incomplete_turn
+    return messages, display_history, incomplete_turn, session_cost
 
 
 def parse_container_info(filepath):
@@ -223,11 +241,6 @@ def parse_arguments():
         action='store_true',
         help='Enable extended thinking for complex reasoning tasks'
     )
-    parser.add_argument(
-        '-s', '--stream',
-        action='store_true',
-        help='Enable streaming output for real-time response display'
-    )
     return parser.parse_args()
 
 
@@ -250,6 +263,7 @@ def main():
     resume_file = None
     container_info = None
     incomplete_turn = None
+    session_cost = 0.0
     
     if args.resume:
         if args.resume == 'LATEST':
@@ -264,7 +278,7 @@ def main():
                 return
         
         print(f"{Fore.CYAN}Resuming from: {resume_file}")
-        initial_messages, display_history, incomplete_turn = parse_debug_file(resume_file)
+        initial_messages, display_history, incomplete_turn, session_cost = parse_debug_file(resume_file)
         container_info = parse_container_info(resume_file)
         
         if display_history:
@@ -289,7 +303,7 @@ def main():
         workspace_dir=workspace,
         debug_file=resume_file,  # None for new session, path for resume
         container_info=container_info,  # None for new session, dict for resume
-        stream=args.stream,
+        stream=True,  # Always stream (required for Opus 4.5 with large output)
         think=args.think
     )
     
@@ -301,6 +315,8 @@ def main():
         agent.messages = initial_messages
     if display_history:
         agent.display_history = display_history
+    if args.resume and session_cost > 0:
+        agent.session_cost = session_cost
 
     # Create key bindings and style
     bindings = create_key_bindings()
@@ -315,13 +331,8 @@ def main():
     print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
     
     # Show enabled features
-    features = []
-    if args.stream:
-        features.append("streaming")
     if args.think:
-        features.append("extended thinking")
-    if features:
-        print(f"{Fore.CYAN}Features: {', '.join(features)}")
+        print(f"{Fore.CYAN}Features: extended thinking")
     
     print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit")
 

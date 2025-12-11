@@ -1,6 +1,10 @@
 """NTN - Minimal AI coding agent powered by Claude"""
 
-__version__ = "0.1.1"
+try:
+    from ._version import __version__
+except ImportError:
+    __version__ = "0.1.0"  # Fallback for editable installs
+
 __author__ = "NTN"
 
 from .agent import CodingAgent, ContainerManager, print_divider

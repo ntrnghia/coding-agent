@@ -18,7 +18,7 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
 - **Prompt caching**: System prompt and tools are cached to reduce rate limit usage
-- **Streaming output**: Real-time response display with `-s` flag
+- **Streaming output**: Real-time response display (always enabled)
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
 
 ## Installation
@@ -65,11 +65,6 @@ ntn -r
 ntn -r debug/debug_20251210_120000.txt
 ```
 
-Enable streaming output (real-time text display):
-```bash
-ntn -s
-```
-
 Enable extended thinking (better for complex reasoning):
 ```bash
 ntn -t
@@ -77,7 +72,7 @@ ntn -t
 
 Combine flags:
 ```bash
-ntn -s -t  # Streaming with extended thinking
+ntn -t -r  # Resume with extended thinking
 ntn -s -r  # Resume with streaming
 ```
 
