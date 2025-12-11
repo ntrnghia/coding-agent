@@ -514,12 +514,19 @@ Always verify your actions and explain what you're doing."""
     def _count_tokens(self, messages):
         """Count tokens for given messages using Anthropic API"""
         try:
-            response = self.client.messages.count_tokens(
-                model=self.model,
-                system=self._get_system_with_cache(),
-                tools=self._get_tool_schemas(),
-                messages=messages
-            )
+            kwargs = {
+                "model": self.model,
+                "system": self._get_system_with_cache(),
+                "tools": self._get_tool_schemas(),
+                "messages": messages
+            }
+            # Include thinking config if enabled - affects token counting
+            if self.think:
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self.thinking_budget
+                }
+            response = self.client.messages.count_tokens(**kwargs)
             return response.input_tokens
         except Exception as e:
             # Fallback: estimate ~4 chars per token
@@ -855,8 +862,9 @@ Always verify your actions and explain what you're doing."""
         else:
             output_str = "N/A"
         
-        # Context usage - estimate from messages if not yet set
-        if self.context_tokens == 0 and self.messages:
+        # Context usage - always calculate current tokens for accurate display
+        # (API usage shows tokens at call time, but messages grow after response is added)
+        if self.messages:
             self.context_tokens = self._count_tokens(self.messages)
         
         context_pct = (self.context_tokens / self.MAX_CONTEXT_TOKENS) * 100
