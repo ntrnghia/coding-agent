@@ -31,24 +31,18 @@ class ContainerManager:
         self.image = self.DEFAULT_IMAGE
     
     @staticmethod
-    def windows_to_mount_path(win_path):
-        """Convert Windows path to container mount path
+    def convert_path(win_path, lowercase=False):
+        """Convert Windows path to Unix-style path
         D:\\Downloads\\coding_agent → /d/downloads/coding_agent
+        
+        Args:
+            win_path: Windows path to convert
+            lowercase: If True, lowercase entire path (for mount targets)
         """
         path = os.path.normpath(win_path).replace('\\', '/')
         if len(path) > 1 and path[1] == ':':
             path = '/' + path[0].lower() + path[2:]
-        return path.lower()
-    
-    @staticmethod
-    def windows_to_docker_path(win_path):
-        """Convert Windows path to Docker -v compatible format
-        D:\\Downloads\\coding_agent → /d/downloads/coding_agent (for Docker on Windows)
-        """
-        path = win_path.replace('\\', '/')
-        if len(path) > 1 and path[1] == ':':
-            path = '/' + path[0].lower() + path[2:]
-        return path
+        return path.lower() if lowercase else path
     
     def is_path_covered(self, new_path):
         """Check if a path is already covered by an existing mount"""
@@ -71,18 +65,17 @@ class ContainerManager:
         """Build Docker -v mount arguments for all working directories"""
         args = []
         for path in self.working_dirs:
-            docker_path = self.windows_to_docker_path(path)
-            mount_path = self.windows_to_mount_path(path)
+            docker_path = self.convert_path(path)
+            mount_path = self.convert_path(path, lowercase=True)
             args.extend(["-v", f"{docker_path}:{mount_path}"])
         return args
     
     def get_mount_info(self):
         """Get mount information for system prompt"""
-        info = []
-        for path in self.working_dirs:
-            mount_path = self.windows_to_mount_path(path)
-            info.append(f"  - {path} → {mount_path}")
-        return "\n".join(info)
+        return "\n".join(
+            f"  - {path} → {self.convert_path(path, lowercase=True)}"
+            for path in self.working_dirs
+        )
     
     def container_exists(self):
         """Check if container exists (running or stopped)"""
@@ -379,24 +372,20 @@ Always verify your actions and explain what you're doing."""
     def add_working_directory(self, path):
         """Add a working directory to the container. Returns status message."""
         needs_restart = self.container_manager.add_working_dir(path)
+        mount_path = ContainerManager.convert_path(path, lowercase=True)
         
         if not needs_restart:
-            mount_path = ContainerManager.windows_to_mount_path(path)
             return {"status": "already_mounted", "mount_path": mount_path}
         
         # Need to restart container with new mount
-        if self.container_manager.container_running():
-            result = self.container_manager.restart_with_new_mounts()
-        else:
-            result = self.container_manager.start()
+        result = (self.container_manager.restart_with_new_mounts() 
+                  if self.container_manager.container_running() 
+                  else self.container_manager.start())
         
-        # Update system message with new mount info
+        # Update system message and log container info
         self._update_system_message()
-        
-        # Log container info for resume
         self._log_container_info()
         
-        mount_path = ContainerManager.windows_to_mount_path(path)
         result["mount_path"] = mount_path
         return result
     
@@ -764,7 +753,7 @@ Always verify your actions and explain what you're doing."""
                             text = event.delta.text
                             current_text += text
                             if print_text:
-                                print(text, end="", flush=True)
+                                print(f"{Fore.GREEN}{text}", end="", flush=True)
                         elif event.delta.type == "input_json_delta":
                             tool_input_json += event.delta.partial_json
                 
@@ -780,7 +769,7 @@ Always verify your actions and explain what you're doing."""
                     if current_text:
                         content_list.append({"type": "text", "text": current_text})
                         if print_text and text_started:
-                            print()  # New line after text
+                            print(Style.RESET_ALL)  # Reset color and new line after text
                         current_text = ""
                         text_started = False
                     if current_tool_use:
@@ -845,19 +834,21 @@ Always verify your actions and explain what you're doing."""
         """Print rate limit and context usage status with visual separator (call before user input)"""
         inner_width = DIVIDER_WIDTH - 2  # Account for side borders
         
-        # Input rate limit
+        # Input rate limit (show used/limit)
         if self.rate_limit_info and self.rate_limit_info.get("input_limit") and self.rate_limit_info.get("input_remaining") is not None:
             rl = self.rate_limit_info
-            input_pct = (rl["input_remaining"] / rl["input_limit"]) * 100
-            input_str = f"{rl['input_remaining']:,}/{rl['input_limit']:,} ({input_pct:.0f}%)"
+            input_used = rl["input_limit"] - rl["input_remaining"]
+            input_pct = (input_used / rl["input_limit"]) * 100
+            input_str = f"{input_used:,}/{rl['input_limit']:,} ({input_pct:.0f}%)"
         else:
             input_str = "N/A"
         
-        # Output rate limit
+        # Output rate limit (show used/limit)
         if self.rate_limit_info and self.rate_limit_info.get("output_limit") and self.rate_limit_info.get("output_remaining") is not None:
             rl = self.rate_limit_info
-            output_pct = (rl["output_remaining"] / rl["output_limit"]) * 100
-            output_str = f"{rl['output_remaining']:,}/{rl['output_limit']:,} ({output_pct:.0f}%)"
+            output_used = rl["output_limit"] - rl["output_remaining"]
+            output_pct = (output_used / rl["output_limit"]) * 100
+            output_str = f"{output_used:,}/{rl['output_limit']:,} ({output_pct:.0f}%)"
         else:
             output_str = "N/A"
         
@@ -880,6 +871,7 @@ Always verify your actions and explain what you're doing."""
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {rate_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {context_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
         print(f"{Style.DIM}╰{'─' * inner_width}╯{Style.RESET_ALL}")
+        print()  # Blank line before user prompt
     
     def _response_to_content_list(self, response, print_text=True):
         """Convert response.content to serializable format and optionally print text."""
@@ -922,6 +914,61 @@ Always verify your actions and explain what you're doing."""
                         if block.get("type") != "thinking" or block.get("signature")
                     ]
 
+    def _execute_tools(self, response, prefix=""):
+        """Execute tool calls from response and return tool_results.
+        
+        Args:
+            response: API response containing tool_use blocks
+            prefix: Optional prefix for display (e.g., "(Executing) " for resume)
+        
+        Returns:
+            list: Tool results ready to be added to messages
+        """
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_name = block.name
+                tool_input = block.input
+                
+                description = get_tool_description(tool_name, tool_input)
+                print(f"{Fore.YELLOW}{prefix}{description}{Style.RESET_ALL}")
+                self.display_history.append(("tool", description))
+                
+                tool = self.tool_map[tool_name]
+                result = tool.execute(**tool_input)
+                
+                if "error" in result:
+                    print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result)
+                })
+        return tool_results
+
+    def _process_response(self, response, content_list):
+        """Process response content - print if not streaming, update display history.
+        
+        Args:
+            response: API response object
+            content_list: Serialized content list from response
+        
+        Returns:
+            list: Text blocks from the response
+        """
+        agent_texts = []
+        for block in content_list:
+            if block.get("type") == "thinking":
+                self.display_history.append(("thinking", "🧠 Thinking..."))
+                if not self.stream:
+                    print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
+            elif block.get("type") == "text":
+                if not self.stream:
+                    print(f"{Fore.GREEN}Agent: {block['text']}{Style.RESET_ALL}")
+                agent_texts.append(block["text"])
+        return agent_texts
+
     def run(self, user_input, max_turns=100, initial_messages=None, display_history=None):
         """Main agent loop
         
@@ -945,101 +992,51 @@ Always verify your actions and explain what you're doing."""
             self._ensure_thinking_blocks()
         
         # Check and compact if needed before processing
-        if self.messages:  # Only check if we have existing messages
-            if not self._check_and_compact_if_needed(user_input):
-                print(f"{Fore.RED}Failed to process due to context limit{Style.RESET_ALL}")
-                return None
+        if self.messages and not self._check_and_compact_if_needed(user_input):
+            print(f"{Fore.RED}Failed to process due to context limit{Style.RESET_ALL}")
+            return None
         
-        current_input = user_input
         turn_num = len([h for h in self.display_history if h[0] == "user"])
-        is_first_sub_turn = True
+        self._log_turn_start(turn_num, user_input)
+        
+        return self._agent_loop(user_input, max_turns)
 
-        for i in range(max_turns):
-            # Log user input / tool results at start of sub-turn
-            if is_first_sub_turn:
-                self._log_turn_start(turn_num, current_input)
-                is_first_sub_turn = False
+    def _agent_loop(self, initial_input, max_turns):
+        """Core agent loop for processing messages and tool calls.
+        
+        Args:
+            initial_input: User message or tool_results to start with (None to skip first chat)
+            max_turns: Maximum iterations
+        
+        Returns:
+            Final API response
+        """
+        current_input = initial_input
+        
+        for _ in range(max_turns):
+            # Call API
+            if current_input is not None:
+                response = self.chat(current_input)
+                content_list = self.messages[-1]["content"]  # chat() already appended
             else:
-                # Continuing turn with tool results - already logged in previous iteration
-                pass
-
-            response = self.chat(current_input)
-
-            # Convert response to serializable format and log immediately
-            # Note: _call_api already handles printing when streaming is enabled
-            content_list = []
-            agent_texts = []
-            for block in response.content:
-                if block.type == "thinking":
-                    # Store thinking block with signature for resume capability
-                    thinking_block = {"type": "thinking", "thinking": block.thinking}
-                    if hasattr(block, 'signature') and block.signature:
-                        thinking_block["signature"] = block.signature
-                    content_list.append(thinking_block)
-                    # Add to display history for resume
-                    self.display_history.append(("thinking", "🧠 Thinking..."))
-                    # Print indicator if not streaming (streaming already showed it)
-                    if not self.stream:
-                        print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
-                elif hasattr(block, 'text'):
-                    content_list.append({"type": "text", "text": block.text})
-                    # Only print if not streaming (streaming already printed)
-                    if not self.stream:
-                        print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
-                    agent_texts.append(block.text)
-                elif block.type == "tool_use":
-                    content_list.append({
-                        "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input
-                    })
-
-            # Log assistant response immediately
+                # Direct API call (for continue_incomplete_turn)
+                response, content_list = self._call_api()
+                self.messages.append({"role": "assistant", "content": content_list})
+            
+            # Log and process response
             self._log_assistant(content_list)
-
-            # Handle tool use
+            agent_texts = self._process_response(response, content_list)
+            
             if response.stop_reason == "tool_use":
-                tool_results = []
-
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_name = block.name
-                        tool_input = block.input
-
-                        # Print concise description to console
-                        description = get_tool_description(tool_name, tool_input)
-                        print(f"{Fore.YELLOW}{description}{Style.RESET_ALL}")
-                        self.display_history.append(("tool", description))
-
-                        # Execute tool
-                        tool = self.tool_map[tool_name]
-                        result = tool.execute(**tool_input)
-
-                        # Only print errors to console
-                        if "error" in result:
-                            print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
-
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(result)
-                        })
-
-                # Log tool results immediately
+                tool_results = self._execute_tools(response)
                 self._log_tool_results(tool_results)
                 current_input = tool_results
             else:
-                # Agent finished
-                
-                # Log end of turn
                 self._log_end_turn()
-                
                 if agent_texts:
                     self.display_history.append(("assistant", "\n".join(agent_texts)))
-                
                 return response
-
+        
         print(f"{Fore.RED}Max turns reached{Style.RESET_ALL}")
         self._log_raw("Max turns reached")
         return response
@@ -1054,20 +1051,13 @@ Always verify your actions and explain what you're doing."""
             max_turns: Maximum remaining tool-use iterations
         """
         if incomplete_turn["type"] == "execute_tools":
-            # Need to execute tools that weren't run before crash
-            tool_uses = incomplete_turn["tool_uses"]
+            # Execute tools that weren't run before crash
             tool_results = []
-            
-            for tool_use in tool_uses:
-                tool_name = tool_use["name"]
-                tool_input = tool_use["input"]
+            for tool_use in incomplete_turn["tool_uses"]:
+                description = get_tool_description(tool_use["name"], tool_use["input"])
+                print(f"{Fore.YELLOW}(Resuming) {description}{Style.RESET_ALL}")
                 
-                description = get_tool_description(tool_name, tool_input)
-                print(f"{Fore.YELLOW}(Executing) {description}{Style.RESET_ALL}")
-                
-                tool = self.tool_map[tool_name]
-                result = tool.execute(**tool_input)
-                
+                result = self.tool_map[tool_use["name"]].execute(**tool_use["input"])
                 if "error" in result:
                     print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
                 
@@ -1077,76 +1067,19 @@ Always verify your actions and explain what you're doing."""
                     "content": json.dumps(result)
                 })
             
-            # Add tool results to messages and log
             self.messages.append({"role": "user", "content": tool_results})
             self._log_tool_results(tool_results)
             
-        elif incomplete_turn["type"] == "continue":
-            # Messages already has everything (including tool_results)
-            # Just need to call API to continue generation
-            pass
-        else:
+        elif incomplete_turn["type"] != "continue":
             print(f"{Fore.RED}Unknown incomplete turn type: {incomplete_turn['type']}{Style.RESET_ALL}")
             return None
         
-        # If thinking is enabled, ensure all assistant messages have thinking blocks
+        # Ensure thinking blocks are valid
         if self.think:
             self._ensure_thinking_blocks()
         
-        # Continue the agent loop - call API with current messages
-        for i in range(max_turns):
-            # Call API without modifying messages first (they're already set up)
-            response, content_list = self._call_api()
-            
-            # Add assistant response to messages
-            self.messages.append({"role": "assistant", "content": content_list})
-            
-            # Extract text and log (only print if not streaming)
-            agent_texts = [b["text"] for b in content_list if b.get("type") == "text"]
-            if not self.stream:
-                for text in agent_texts:
-                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
-            
-            # Log assistant response immediately
-            self._log_assistant(content_list)
-            
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_name = block.name
-                        tool_input = block.input
-                        
-                        description = get_tool_description(tool_name, tool_input)
-                        print(f"{Fore.YELLOW}{description}{Style.RESET_ALL}")
-                        self.display_history.append(("tool", description))
-                        
-                        tool = self.tool_map[tool_name]
-                        result = tool.execute(**tool_input)
-                        
-                        if "error" in result:
-                            print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
-                        
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(result)
-                        })
-                
-                # Add tool results to messages and log
-                self.messages.append({"role": "user", "content": tool_results})
-                self._log_tool_results(tool_results)
-            else:
-                self._log_end_turn()
-                
-                if agent_texts:
-                    self.display_history.append(("assistant", "\n".join(agent_texts)))
-                
-                return response
-        
-        print(f"{Fore.RED}Max turns reached{Style.RESET_ALL}")
-        return response
+        # Continue with agent loop (pass None to skip first chat call)
+        return self._agent_loop(None, max_turns)
 
     def get_state_for_resume(self):
         """Get current state for saving/resuming"""

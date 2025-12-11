@@ -42,81 +42,46 @@ def get_tool_description(tool_name, tool_input):
 
 def _parse_exec_command(cmd):
     """Parse exec command into human-readable description"""
-    # Handle piped commands: split by | and analyze
     parts = [p.strip() for p in cmd.split('|')]
     main_cmd = parts[0]
     
-    # Check for line limiting in pipe (head/tail)
+    # Check for line limiting in pipe
     line_info = ""
     for part in parts[1:]:
-        head_match = re.match(r'head\s+(?:-n\s*)?(\d+)', part)
-        tail_match = re.match(r'tail\s+(?:-n\s*)?(\d+)', part)
-        if head_match:
-            line_info = f" (first {head_match.group(1)} lines)"
-        elif tail_match:
-            line_info = f" (last {tail_match.group(1)} lines)"
+        if match := re.match(r'(head|tail)\s+(?:-n\s*)?(\d+)', part):
+            line_info = f" ({'first' if match.group(1) == 'head' else 'last'} {match.group(2)} lines)"
     
-    # Parse main command
-    if main_cmd.startswith("ls"):
-        return "📂 List files"
+    # Simple command mappings
+    simple_cmds = {
+        "ls": "📂 List files", "find ": "🔎 Find files",
+        "grep ": "🔎 Search in files", "wc ": "📊 Count lines/words"
+    }
+    for prefix, desc in simple_cmds.items():
+        if main_cmd.startswith(prefix):
+            return desc
     
-    # Write/Edit file: cat > file.py or cat >> file.py
-    elif main_cmd.startswith("cat >") or main_cmd.startswith("cat>>"):
-        # Extract filename between > and << (or end)
-        match = re.search(r'cat\s*>>?\s*([^\s<]+)', main_cmd)
-        if match:
-            filepath = match.group(1).strip()
-            filename = filepath.split('/')[-1]
-            if ">>" in main_cmd:
-                return f"✏️ Append to {filename}"
-            return f"✏️ Edit {filename}"
-        return "✏️ Edit file"
+    # File read/write commands
+    if main_cmd.startswith("cat"):
+        if ">>" in main_cmd or main_cmd.startswith("cat >"):
+            match = re.search(r'cat\s*>>?\s*([^\s<]+)', main_cmd)
+            filename = match.group(1).split('/')[-1] if match else "file"
+            return f"✏️ {'Append to' if '>>' in main_cmd else 'Edit'} {filename}"
+        elif ">" not in main_cmd and (match := re.search(r'cat\s+([^|]+)', main_cmd)):
+            return f"📄 Read {match.group(1).strip().split('/')[-1]}{line_info}"
     
-    # Read file: cat file.py (no > redirect)
-    elif main_cmd.startswith("cat ") and ">" not in main_cmd:
-        match = re.search(r'cat\s+([^|]+)', main_cmd)
-        if match:
-            filepath = match.group(1).strip()
-            filename = filepath.split('/')[-1]
-            return f"📄 Read {filename}{line_info}"
-        return f"📄 Read file{line_info}"
+    # Head/tail commands
+    for cmd_name, direction in [("head", "first"), ("tail", "last")]:
+        if main_cmd.startswith(f"{cmd_name} "):
+            if match := re.match(rf'{cmd_name}\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd):
+                num, filepath = match.group(1), match.group(2)
+                if filepath:
+                    filename = filepath.strip().split('/')[-1]
+                    suffix = f" ({direction} {num.lstrip('-')} lines)" if num else ""
+                    return f"📄 Read {filename}{suffix}"
+            return "📄 Read file"
     
-    elif main_cmd.startswith("head "):
-        match = re.match(r'head\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
-        if match:
-            num = match.group(1)
-            filepath = match.group(2)
-            if filepath:
-                filename = filepath.strip().split('/')[-1]
-                if num:
-                    return f"📄 Read {filename} (first {num.lstrip('-')} lines)"
-                return f"📄 Read {filename}"
-        return "📄 Read file"
-    
-    elif main_cmd.startswith("tail "):
-        match = re.match(r'tail\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd)
-        if match:
-            num = match.group(1)
-            filepath = match.group(2)
-            if filepath:
-                filename = filepath.strip().split('/')[-1]
-                if num:
-                    return f"📄 Read {filename} (last {num.lstrip('-')} lines)"
-                return f"📄 Read {filename}"
-        return "📄 Read file"
-    
-    elif main_cmd.startswith("find "):
-        return "🔎 Find files"
-    
-    elif main_cmd.startswith("grep "):
-        return "🔎 Search in files"
-    
-    elif main_cmd.startswith("wc "):
-        return "📊 Count lines/words"
-    
-    else:
-        display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
-        return f"⚡ Run: {display_cmd}"
+    display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
+    return f"⚡ Run: {display_cmd}"
 
 
 class TerminalTool:

@@ -156,6 +156,10 @@ def parse_debug_file(filepath):
                 if tool_uses:
                     # Need to execute tools, then continue
                     incomplete_turn = {"type": "execute_tools", "tool_uses": tool_uses}
+            elif messages and messages[-1].get("role") == "user":
+                # Crashed after user input but before assistant responded
+                # Need to call API to get response
+                incomplete_turn = {"type": "continue"}
     
     return messages, display_history, incomplete_turn
 
@@ -183,22 +187,23 @@ def parse_container_info(filepath):
 
 def replay_display_history(display_history):
     """Print the conversation history for resume"""
+    role_formats = {
+        "user": (Style.RESET_ALL, "You:"),
+        "thinking": (Fore.MAGENTA, ""),
+        "assistant": (Fore.GREEN, "Agent:"),
+        "tool": (Fore.YELLOW, "")
+    }
     is_first_user = True
     for role, content in display_history:
         if role == "user":
-            # Print divider before each user message (except first)
             if not is_first_user:
-                print()
-                print_divider()
-                print()
+                print(); print_divider(); print()
             is_first_user = False
-            print(f"{Fore.CYAN}You:{Style.RESET_ALL} {content}")
-        elif role == "thinking":
-            print(f"{Fore.MAGENTA}{content}{Style.RESET_ALL}")
-        elif role == "assistant":
-            print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {content}")
-        elif role == "tool":
-            print(f"{Fore.YELLOW}{content}{Style.RESET_ALL}")
+        color, prefix = role_formats.get(role, (Style.RESET_ALL, ""))
+        print(f"{color}{prefix + ' ' if prefix else ''}{content}{Style.RESET_ALL}")
+        # Add divider after user message
+        if role == "user":
+            print(); print_divider(); print()
     print()
 
 
@@ -324,6 +329,9 @@ def main():
         try:
             print(f"{Fore.YELLOW}Continuing interrupted turn...{Style.RESET_ALL}")
             agent.continue_incomplete_turn(incomplete_turn)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Interrupted by user")
+            agent._log_end_turn()
         except Exception as e:
             print(f"{Fore.RED}Error continuing turn: {e}{Style.RESET_ALL}")
 
@@ -345,6 +353,10 @@ def main():
 
             if not user_input:
                 continue
+
+            print()
+            print_divider()
+            print()
 
             try:
                 agent.run(user_input)
