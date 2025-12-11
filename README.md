@@ -1,4 +1,4 @@
-# Coding Agent with Claude Opus 4.5
+# NTN - Coding Agent with Claude Opus 4.5
 
 A minimal AI agent that uses Claude API to help with coding tasks in a workspace.
 
@@ -21,56 +21,69 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Streaming output**: Real-time response display with `-s` flag
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
 
-## Setup
+## Installation
 
-1. Install dependencies:
+Install from PyPI:
 ```bash
-pip install -r requirements.txt
+pip install ntn
 ```
 
-2. Set your Anthropic API key:
+Or install from source:
+```bash
+git clone https://github.com/yourusername/ntn.git
+cd ntn
+pip install -e .
+```
+
+## Setup
+
+Set your Anthropic API key:
 ```bash
 export ANTHROPIC_API_KEY='your-api-key-here'
 ```
 
-Or create a `.env` file (copy from `.env.example`):
+Or create a `.env` file:
 ```bash
-cp .env.example .env
-# Edit .env and add your API key
+echo "ANTHROPIC_API_KEY=your-api-key-here" > .env
 ```
 
-3. (Optional) Install Docker for sandbox functionality.
+(Optional) Install Docker for sandbox functionality.
 
 ## Usage
 
 Run the agent:
 ```bash
-python run.py
+ntn
 ```
 
 Resume a previous session:
 ```bash
 # Resume most recent session
-python run.py -r
+ntn -r
 
 # Resume specific session
-python run.py -r debug/debug_20251210_120000.txt
+ntn -r debug/debug_20251210_120000.txt
 ```
 
 Enable streaming output (real-time text display):
 ```bash
-python run.py -s
+ntn -s
 ```
 
 Enable extended thinking (better for complex reasoning):
 ```bash
-python run.py -t
+ntn -t
 ```
 
 Combine flags:
 ```bash
-python run.py -s -t  # Streaming with extended thinking
-python run.py -s -r  # Resume with streaming
+ntn -s -t  # Streaming with extended thinking
+ntn -s -r  # Resume with streaming
+```
+
+Alternative: Run as Python module:
+```bash
+python -m ntn
 ```
 
 **Input controls:**
@@ -85,15 +98,19 @@ Example prompts:
 - "Run pytest on my tests"
 - "Tell me what the code in D:\Downloads\some-project does" (uses Docker sandbox)
 
-## Project Structure
+## Package Structure
 
 ```
-coding_agent/
-├── agent.py           # Main agent with auto-compact and resume support
-├── tools.py           # Tool implementations (Terminal, Web, Docker)
-├── run.py             # Entry point with CLI arguments
-├── requirements.txt   # Dependencies
-└── debug/             # Debug logs (gitignored)
+ntn/
+├── src/ntn/
+│   ├── __init__.py    # Package exports
+│   ├── __main__.py    # Entry for `python -m ntn`
+│   ├── agent.py       # Main agent with auto-compact and resume support
+│   ├── tools.py       # Tool implementations (Terminal, Web, Docker)
+│   └── cli.py         # CLI entry point
+├── pyproject.toml     # Package configuration
+├── LICENSE            # MIT License
+└── README.md          # This file
 ```
 
 ## Tools
@@ -140,10 +157,10 @@ Sessions are logged incrementally to `debug/debug_<timestamp>.txt`. To resume:
 
 ```bash
 # Resume most recent session
-python run.py -r
+ntn -r
 
 # Resume specific session  
-python run.py -r debug/debug_20251210_120000.txt
+ntn -r debug/debug_20251210_120000.txt
 ```
 
 On resume:

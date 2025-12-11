@@ -6,7 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from colorama import Fore, Style, init
-from tools import get_tool_description
+from .tools import get_tool_description
 
 # Initialize colorama
 init(autoreset=True)

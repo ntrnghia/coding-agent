@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""NTN CLI - Minimal AI coding agent powered by Claude"""
 import os
 import sys
 import argparse
@@ -10,8 +11,8 @@ from colorama import Fore, Style, init
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
-from tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
-from agent import CodingAgent, print_divider
+from .tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
+from .agent import CodingAgent, print_divider
 
 # Initialize colorama
 init(autoreset=True)
