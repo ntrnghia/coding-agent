@@ -819,14 +819,13 @@ Always verify your actions and explain what you're doing."""
         # Track context usage from response
         if hasattr(response, 'usage'):
             usage = response.usage
-            # Total context = all input tokens used
+            # Total context = all input tokens used (not output - that has separate limit)
             input_tokens = getattr(usage, 'input_tokens', 0) or 0
             cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
             cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
-            output_tokens = getattr(usage, 'output_tokens', 0) or 0
             
-            # Context is total tokens in conversation history
-            self.context_tokens = input_tokens + cache_creation + cache_read + output_tokens
+            # Context is total input tokens (what counts toward 200K limit)
+            self.context_tokens = input_tokens + cache_creation + cache_read
     
     def print_status(self):
         """Print rate limit and context usage status with visual separator (call before user input)"""
