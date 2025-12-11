@@ -478,14 +478,33 @@ Always verify your actions and explain what you're doing."""
         self._log_raw("")
 
     def _get_tool_schemas(self):
-        return [tool.get_schema() for tool in self.tools]
+        """Get tool schemas with cache_control on the last tool for prompt caching."""
+        schemas = [tool.get_schema() for tool in self.tools]
+        if schemas:
+            # Add cache_control to the last tool for caching
+            schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
+        return schemas
+    
+    def _get_system_with_cache(self):
+        """Get system message formatted for prompt caching.
+        
+        Returns system as an array with cache_control on the last block.
+        Cached tokens don't count toward rate limits!
+        """
+        return [
+            {
+                "type": "text",
+                "text": self.system_message,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]
 
     def _count_tokens(self, messages):
         """Count tokens for given messages using Anthropic API"""
         try:
             response = self.client.messages.count_tokens(
                 model=self.model,
-                system=self.system_message,
+                system=self._get_system_with_cache(),
                 tools=self._get_tool_schemas(),
                 messages=messages
             )
@@ -556,11 +575,11 @@ Always verify your actions and explain what you're doing."""
                 print(f"{Fore.YELLOW}📊 Removing {i} oldest turn(s) and creating summary...{Style.RESET_ALL}")
                 
                 try:
-                    # Call API with candidate messages to get summary
+                    # Call API with candidate messages to get summary (with caching)
                     summary_response = self.client.messages.create(
                         model=self.model,
                         max_tokens=self.MAX_OUTPUT_TOKENS,
-                        system=self.system_message,
+                        system=self._get_system_with_cache(),
                         messages=candidate_messages
                     )
                     
@@ -632,11 +651,12 @@ Always verify your actions and explain what you're doing."""
         """
         max_retries = 3
         
-        # Build API kwargs
+        # Build API kwargs with prompt caching
+        # Cached tokens don't count toward rate limits!
         api_kwargs = {
             "model": self.model,
             "max_tokens": self.MAX_OUTPUT_TOKENS,
-            "system": self.system_message,
+            "system": self._get_system_with_cache(),
             "tools": self._get_tool_schemas(),
             "messages": self.messages
         }
