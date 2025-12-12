@@ -11,7 +11,7 @@ from colorama import Fore, Style, init
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
-from .config import config
+from .config import config, get_color
 from .tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
 from .agent import CodingAgent, print_divider
 
@@ -216,22 +216,17 @@ def parse_container_info(filepath):
 
 def replay_display_history(display_history):
     """Print the conversation history for resume"""
+    prefixes = config.ui.prefixes
     role_formats = {
-        "user": (Style.RESET_ALL, "You:"),
-        "thinking": (Fore.MAGENTA, ""),
-        "assistant": (Fore.GREEN, "Agent:"),
-        "tool": (Fore.YELLOW, "")
+        "user": (get_color("user"), prefixes.user),
+        "thinking": (get_color("thinking"), ""),
+        "assistant": (get_color("assistant"), prefixes.assistant),
+        "tool": (get_color("tool"), "")
     }
-    is_first_user = True
     for role, content in display_history:
-        if role == "user":
-            if not is_first_user:
-                print(); print_divider(); print()
-            is_first_user = False
         color, prefix = role_formats.get(role, (Style.RESET_ALL, ""))
         print(f"{color}{prefix + ' ' if prefix else ''}{content}{Style.RESET_ALL}")
-        # Add divider after user message
-        if role == "user":
+        if role == "user" or role == "assistant":
             print(); print_divider(); print()
 
 

@@ -80,6 +80,28 @@ docker:
 ui:
   divider_width: 80
 
+  # Display prefixes
+  prefixes:
+    user: "You:"
+    assistant: "Agent:"
+
+  # Colors for different elements (colorama color names)
+  # Options: BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, RESET
+  colors:
+    user: "RESET"
+    assistant: "GREEN"
+    thinking: "MAGENTA"
+    tool: "YELLOW"
+    error: "RED"
+    warning: "YELLOW"
+    system: "CYAN"
+    success: "GREEN"
+
+# Agent settings
+agent:
+  max_turns: 100
+  max_retries: 3
+
 # CLI settings
 cli:
   # Time threshold for Shift+Enter detection (seconds)

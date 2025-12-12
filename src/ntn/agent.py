@@ -5,7 +5,7 @@ import subprocess
 import time
 from datetime import datetime
 from colorama import Fore, Style, init
-from .config import config
+from .config import config, get_color
 from .providers import create_provider, Usage
 from .tools import get_tool_description
 from .prompts import get_system_prompt, get_mount_section_text, get_no_mount_section_text
@@ -644,7 +644,7 @@ Provide your response in this format:
         Returns:
             tuple: (response, content_list) where content_list is serializable format
         """
-        max_retries = 3
+        max_retries = config.agent.max_retries
         tool_schemas = [tool.get_schema() for tool in self.tools]
 
         # Build thinking config if enabled
@@ -732,12 +732,12 @@ Provide your response in this format:
                     current_thinking = ""
                     current_thinking_signature = ""
                     if not thinking_shown and print_text:
-                        print(f"{Fore.MAGENTA}Thinking...{Style.RESET_ALL}")
+                        print(f"{get_color('thinking')}Thinking...{Style.RESET_ALL}")
                         thinking_shown = True
 
                 elif event.type == "text_start":
                     if print_text:
-                        print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} ", end="", flush=True)
+                        print(f"{get_color('assistant')}{config.ui.prefixes.assistant}{Style.RESET_ALL} ", end="", flush=True)
                     text_started = True
 
                 elif event.type == "tool_use_start":
@@ -757,7 +757,7 @@ Provide your response in this format:
                 elif event.type == "text_delta":
                     current_text += event.data
                     if print_text:
-                        print(f"{Fore.GREEN}{event.data}", end="", flush=True)
+                        print(f"{get_color('assistant')}{event.data}", end="", flush=True)
 
                 elif event.type == "tool_input_delta":
                     tool_input_json += event.data
@@ -990,7 +990,7 @@ Provide your response in this format:
                 tool_input = block["input"]
 
                 description = get_tool_description(tool_name, tool_input)
-                print(f"{Fore.YELLOW}{prefix}{description}{Style.RESET_ALL}")
+                print(f"{get_color('tool')}{prefix}{description}{Style.RESET_ALL}")
                 self.display_history.append(("tool", description))
 
                 tool = self.tool_map[tool_name]
@@ -1030,7 +1030,7 @@ Provide your response in this format:
                 agent_texts.append(block["text"])
         return agent_texts
 
-    def run(self, user_input, max_turns=100, initial_messages=None, display_history=None):
+    def run(self, user_input, max_turns=None, initial_messages=None, display_history=None):
         """Main agent loop
         
         Args:
@@ -1059,7 +1059,9 @@ Provide your response in this format:
         
         turn_num = len([h for h in self.display_history if h[0] == "user"])
         self._log_turn_start(turn_num, user_input)
-        
+
+        if max_turns is None:
+            max_turns = config.agent.max_turns
         return self._agent_loop(user_input, max_turns)
 
     def _agent_loop(self, initial_input, max_turns):
@@ -1103,7 +1105,7 @@ Provide your response in this format:
         self._log_raw("Max turns reached")
         return response
 
-    def continue_incomplete_turn(self, incomplete_turn, max_turns=100):
+    def continue_incomplete_turn(self, incomplete_turn, max_turns=None):
         """Continue an incomplete turn from a crash
         
         Args:
@@ -1139,7 +1141,9 @@ Provide your response in this format:
         # Ensure thinking blocks are valid
         if self.think:
             self._ensure_thinking_blocks()
-        
+
+        if max_turns is None:
+            max_turns = config.agent.max_turns
         # Continue with agent loop (pass None to skip first chat call)
         return self._agent_loop(None, max_turns)
 

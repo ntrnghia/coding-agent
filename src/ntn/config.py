@@ -5,11 +5,12 @@ Loads configuration from config.yaml bundled with the package.
 API keys are read from environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY).
 
 Usage:
-    from ntn.config import config
+    from ntn.config import config, get_color
 
     model_id = config.models.aliases["gpt"]
     limits = config.models.get_limits(model_id)
     provider = config.models.get_provider(model_id)
+    color = get_color("assistant")  # Returns Fore.GREEN
 """
 
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import yaml
+from colorama import Fore, Style
 
 
 @dataclass(frozen=True)
@@ -74,10 +76,42 @@ class DockerConfig:
 
 
 @dataclass(frozen=True)
+class PrefixesConfig:
+    """Display prefixes for roles."""
+
+    user: str
+    assistant: str
+
+
+@dataclass(frozen=True)
+class ColorsConfig:
+    """Color names for different elements."""
+
+    user: str
+    assistant: str
+    thinking: str
+    tool: str
+    error: str
+    warning: str
+    system: str
+    success: str
+
+
+@dataclass(frozen=True)
 class UIConfig:
     """UI display configuration."""
 
     divider_width: int
+    prefixes: PrefixesConfig
+    colors: ColorsConfig
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Agent behavior configuration."""
+
+    max_turns: int
+    max_retries: int
 
 
 @dataclass(frozen=True)
@@ -126,9 +160,24 @@ class Config:
     models: ModelsConfig
     docker: DockerConfig
     ui: UIConfig
+    agent: AgentConfig
     cli: CLIConfig
     tools: ToolsConfig
     cache: CacheConfig
+
+
+# Color name to colorama mapping
+_COLOR_MAP = {
+    "BLACK": Fore.BLACK,
+    "RED": Fore.RED,
+    "GREEN": Fore.GREEN,
+    "YELLOW": Fore.YELLOW,
+    "BLUE": Fore.BLUE,
+    "MAGENTA": Fore.MAGENTA,
+    "CYAN": Fore.CYAN,
+    "WHITE": Fore.WHITE,
+    "RESET": Style.RESET_ALL,
+}
 
 
 def _load_config() -> Config:
@@ -161,10 +210,17 @@ def _load_config() -> Config:
         web_fetch=WebFetchConfig(**data["tools"]["web_fetch"]),
     )
 
+    ui = UIConfig(
+        divider_width=data["ui"]["divider_width"],
+        prefixes=PrefixesConfig(**data["ui"]["prefixes"]),
+        colors=ColorsConfig(**data["ui"]["colors"]),
+    )
+
     return Config(
         models=models,
         docker=DockerConfig(**data["docker"]),
-        ui=UIConfig(**data["ui"]),
+        ui=ui,
+        agent=AgentConfig(**data["agent"]),
         cli=CLIConfig(**data["cli"]),
         tools=tools,
         cache=CacheConfig(**data["cache"]),
@@ -173,3 +229,16 @@ def _load_config() -> Config:
 
 # Module-level singleton - loaded once on first import
 config = _load_config()
+
+
+def get_color(role: str) -> str:
+    """Get colorama color code for a role.
+
+    Args:
+        role: One of 'user', 'assistant', 'thinking', 'tool', 'error', 'warning', 'system', 'success'
+
+    Returns:
+        Colorama color code (e.g., Fore.GREEN)
+    """
+    color_name = getattr(config.ui.colors, role, "RESET")
+    return _COLOR_MAP.get(color_name.upper(), Style.RESET_ALL)
