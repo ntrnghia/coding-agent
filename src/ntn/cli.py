@@ -93,10 +93,14 @@ def parse_debug_file(filepath):
     incomplete_turn = None
     session_cost = 0.0
     
+    # Parse model from session header (default to opus if not found)
+    model_match = re.search(r'Model: (claude-[\w-]+)', content)
+    model = model_match.group(1) if model_match else "claude-opus-4-5"
+    
     # Parse USAGE lines (new format) and calculate cost
     for usage_str in re.findall(r'--- USAGE: ({.*?}) ---', content):
         try:
-            session_cost += CodingAgent.calculate_cost_from_usage(json.loads(usage_str))
+            session_cost += CodingAgent.calculate_cost_from_usage(json.loads(usage_str), model)
         except (json.JSONDecodeError, ValueError):
             pass
     

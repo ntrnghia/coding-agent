@@ -225,9 +225,9 @@ class CodingAgent:
     
     # Pricing per 1M tokens (USD)
     MODEL_PRICING = {
-        "claude-opus-4-5": {"input": 15, "output": 75, "cache_write": 18.75, "cache_read": 1.50},
+        "claude-opus-4-5": {"input": 5, "output": 25, "cache_write": 6.25, "cache_read": 0.50},
         "claude-sonnet-4-5": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
-        "claude-haiku-4-5": {"input": 0.80, "output": 4, "cache_write": 1.0, "cache_read": 0.08},
+        "claude-haiku-4-5": {"input": 1, "output": 5, "cache_write": 1.25, "cache_read": 0.10},
     }
     
     # Summarization request template
@@ -835,7 +835,7 @@ Provide your response in this format:
             self._calculate_cost(usage)
     
     @staticmethod
-    def calculate_cost_from_usage(usage, model="claude-opus-4-5-20251101"):
+    def calculate_cost_from_usage(usage, model="claude-opus-4-5"):
         """Calculate cost from usage dict. Usage keys: input, output, cache_write, cache_read"""
         pricing = CodingAgent.MODEL_PRICING.get(model, {})
         if not pricing:
