@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from colorama import Fore, Style, init
 from .tools import get_tool_description
+from .prompts import get_system_prompt, get_mount_section_text, get_no_mount_section_text
 
 # Initialize colorama
 init(autoreset=True)
@@ -211,14 +212,22 @@ class ContainerManager:
 class CodingAgent:
     """Minimal AI agent for coding workspace"""
     
-    # Context limits for claude-opus-4-5-20251101
+    # Model configurations: short name -> full model ID
+    MODELS = {
+        "opus": "claude-opus-4-5",
+        "sonnet": "claude-sonnet-4-5",
+        "haiku": "claude-haiku-4-5",
+    }
+    
+    # Context limits by model
     MAX_CONTEXT_TOKENS = 200000
     MAX_OUTPUT_TOKENS = 64000  # Conservative output limit
     
-    # Pricing per 1M tokens (USD) - update when changing models
+    # Pricing per 1M tokens (USD)
     MODEL_PRICING = {
-        "claude-opus-4-5-20251101": {"input": 5, "output": 25, "cache_write": 6.25, "cache_read": 0.50},
-        "claude-sonnet-4-20250514": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
+        "claude-opus-4-5": {"input": 15, "output": 75, "cache_write": 18.75, "cache_read": 1.50},
+        "claude-sonnet-4-5": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.30},
+        "claude-haiku-4-5": {"input": 0.80, "output": 4, "cache_write": 1.0, "cache_read": 0.08},
     }
     
     # Summarization request template
@@ -246,11 +255,12 @@ Provide your response in this format:
 (Your answer to the current question)
 [/ANSWER]"""
 
-    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None, stream=False, think=False):
+    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None, stream=False, think=False, model="opus"):
         self.client = anthropic.Anthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY")
         )
-        self.model = "claude-opus-4-5-20251101"
+        # Resolve model short name to full model ID
+        self.model = self.MODELS.get(model, self.MODELS["opus"])
         self.workspace_dir = workspace_dir
         self.messages = []
         self.tools = tools
@@ -336,54 +346,22 @@ Provide your response in this format:
                 self._log_container_info()
     
     def _update_system_message(self):
-        """Update system message with current mount mappings"""
+        """Update system message with current mount mappings.
+        
+        The system prompt is designed to reach ~4500 tokens when combined with tools (~1113 tokens)
+        to meet Opus 4.5's 4096 minimum cacheable token requirement.
+        """
         mount_info = self.container_manager.get_mount_info()
         
         if mount_info:
-            mount_section = f"""
-Current mounted directories (container: {self.container_manager.container_name}):
-{mount_info}
-
-Use these paths directly in docker_sandbox with action="exec"."""
+            mount_section = get_mount_section_text(
+                self.container_manager.container_name,
+                mount_info
+            )
         else:
-            mount_section = """
-No directories are currently mounted. Use docker_sandbox with action="start" to mount a directory first."""
+            mount_section = get_no_mount_section_text()
         
-        self.system_message = f"""You are an AI coding assistant. Your workspace is at {self.workspace_dir}.
-You can search the web and fetch documentation.
-
-CRITICAL: For ALL file operations (reading, writing, listing, searching), you MUST use the docker_sandbox tool.
-This provides a consistent Linux environment with standard Unix tools (ls, cat, grep, find, etc.).
-
-How to use docker_sandbox:
-1. First mount the directory: docker_sandbox with action="start" and mount_path="<path>"
-2. Then run commands: docker_sandbox with action="exec" and command="<unix command>"
-3. Paths are mapped: D:\\path → /d/path (Unix-style)
-
-Your workspace is already mounted at startup. To access it:
-- docker_sandbox action="exec" command="ls -la /d/downloads/project"
-- docker_sandbox action="exec" command="cat /d/downloads/project/file.py"
-{mount_section}
-
-DO NOT use execute_command for file operations - it runs on Windows and lacks Unix tools.
-Use execute_command ONLY for Windows-specific tasks (like running Python scripts with specific Windows paths).
-
-File operation examples in Docker:
-- List files: ls -la /d/path
-- Read file: cat /d/path/file.py
-- Search: grep -r "pattern" /d/path
-- Find files: find /d/path -name "*.py"
-- Write file: cat > /d/path/file.py << 'EOF'
-...content...
-EOF
-
-Container behavior:
-- A single container persists for the entire session
-- All directories are mounted in the same container
-- Adding a new directory may require a container restart (you'll be notified)
-- Only call action="stop" when completely finished with all work
-
-Always verify your actions and explain what you're doing."""
+        self.system_prompt = get_system_prompt(self.workspace_dir, mount_section)
     
     def add_working_directory(self, path):
         """Add a working directory to the container. Returns status message."""
@@ -515,7 +493,7 @@ Always verify your actions and explain what you're doing."""
         return [
             {
                 "type": "text",
-                "text": self.system_message,
+                "text": self.system_prompt,
                 "cache_control": {"type": "ephemeral"}
             }
         ]
@@ -539,7 +517,7 @@ Always verify your actions and explain what you're doing."""
             return response.input_tokens
         except Exception as e:
             # Fallback: estimate ~4 chars per token
-            total_chars = len(self.system_message)
+            total_chars = len(self.system_prompt)
             for msg in messages:
                 if isinstance(msg.get("content"), str):
                     total_chars += len(msg["content"])

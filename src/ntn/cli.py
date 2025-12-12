@@ -241,6 +241,12 @@ def parse_arguments():
         action='store_true',
         help='Enable extended thinking for complex reasoning tasks'
     )
+    parser.add_argument(
+        '-m', '--model',
+        choices=['opus', 'sonnet', 'haiku'],
+        default='opus',
+        help='Model to use: opus (default), sonnet, or haiku'
+    )
     return parser.parse_args()
 
 
@@ -304,7 +310,8 @@ def main():
         debug_file=resume_file,  # None for new session, path for resume
         container_info=container_info,  # None for new session, dict for resume
         stream=True,  # Always stream (required for Opus 4.5 with large output)
-        think=args.think
+        think=args.think,
+        model=args.model
     )
     
     # Wire up DockerSandboxTool with agent reference
@@ -331,8 +338,10 @@ def main():
     # print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
     
     # Show enabled features
+    features = [f"model: {args.model}"]
     if args.think:
-        print(f"{Fore.CYAN}Features: extended thinking")
+        features.append("extended thinking")
+    print(f"{Fore.CYAN}Features: {', '.join(features)}")
     
     print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit")
 

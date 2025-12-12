@@ -18,6 +18,7 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
 - **Prompt caching**: System prompt and tools are cached to reduce rate limit usage
+- **Model selection**: Choose between Opus, Sonnet, or Haiku models with `-m` flag
 - **Streaming output**: Real-time response display (always enabled)
 - **Cost tracking**: Shows per-request and session costs with token usage
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
@@ -71,9 +72,17 @@ Enable extended thinking (better for complex reasoning):
 ntn -t
 ```
 
+Use a different model:
+```bash
+ntn -m sonnet  # Use Claude Sonnet 4.5 (faster, cheaper)
+ntn -m haiku   # Use Claude Haiku 4.5 (fastest, cheapest)
+ntn -m opus    # Use Claude Opus 4.5 (default, most capable)
+```
+
 Combine flags:
 ```bash
-ntn -t -r  # Resume with extended thinking
+ntn -t -r           # Resume with extended thinking
+ntn -m sonnet -t    # Sonnet with extended thinking
 ```
 
 Alternative: Run as Python module:
