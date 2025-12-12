@@ -53,20 +53,36 @@ def get_tool_schemas():
     ]
     return [tool.get_schema() for tool in tools]
 
+# Overhead constant: count_tokens includes message framing (~323 tokens) + message itself
+# Using 'x' (1 token) as minimal message, total overhead is 324 tokens
+MESSAGE_OVERHEAD = 324
+
 
 def count_tokens(client, model, system_text, tools=None):
-    """Count tokens for the given system prompt and tools."""
+    """Count tokens for the given system prompt and tools.
+    
+    Uses minimal 'x' message (1 token) to get accurate count.
+    """
     system = [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
     kwargs = {
         "model": model,
         "system": system,
-        "messages": [{"role": "user", "content": "test"}]
+        "messages": [{"role": "user", "content": "x"}]  # Minimal 1-token message
     }
     if tools:
         kwargs["tools"] = tools
     
     response = client.messages.count_tokens(**kwargs)
     return response.input_tokens
+
+
+def predict_cacheable_tokens(count_tokens_result):
+    """Predict how many tokens will be cached.
+    
+    Formula: cacheable = count_tokens('x') - 324
+    Where 324 = 323 (framing overhead) + 1 ('x' token)
+    """
+    return count_tokens_result - MESSAGE_OVERHEAD
 
 
 def test_caching(client, model, system_text, tools):
@@ -125,23 +141,28 @@ def main():
             # Count tokens
             system_only = count_tokens(client, model, system_text)
             with_tools = count_tokens(client, model, system_text, tools)
-            tools_approx = with_tools - system_only + 8  # approximate tools tokens
             
-            print(f"   System prompt: {system_only} tokens")
-            print(f"   System + tools: {with_tools} tokens")
-            print(f"   Tools (approx): {tools_approx} tokens")
+            # Predict cacheable tokens (before sending actual request)
+            predicted_cacheable = predict_cacheable_tokens(with_tools)
+            
+            print(f"   System prompt tokens: {predict_cacheable_tokens(system_only)}")
+            print(f"   System + tools tokens: {with_tools} (total with overhead)")
+            print(f"   Predicted cacheable: {predicted_cacheable} tokens")
             
             # Check if meets requirement
-            meets_requirement = with_tools >= min_tokens
+            meets_requirement = predicted_cacheable >= min_tokens
             status = "✅ MEETS" if meets_requirement else "❌ BELOW"
-            print(f"   {status} minimum requirement ({with_tools} vs {min_tokens})")
+            print(f"   {status} minimum requirement ({predicted_cacheable} vs {min_tokens})")
             
             # Actually test caching for all models
             if meets_requirement:
                 print("   Testing actual cache behavior...")
                 result = test_caching(client, model, system_text, tools)
+                actual_cached = result['cache_creation'] or result['cache_read']
+                
                 if result["caching_works"]:
-                    print(f"   ✅ CACHING WORKS! (created: {result['cache_creation']}, read: {result['cache_read']})")
+                    accuracy = "✓" if actual_cached == predicted_cacheable else f"(predicted: {predicted_cacheable})"
+                    print(f"   ✅ CACHING WORKS! Cached: {actual_cached} tokens {accuracy}")
                 else:
                     print(f"   ❌ CACHING NOT WORKING (created: {result['cache_creation']}, read: {result['cache_read']})")
         

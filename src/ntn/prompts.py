@@ -100,15 +100,10 @@ When writing Python code:
 === JAVASCRIPT/TYPESCRIPT GUIDELINES ===
 
 When writing JavaScript or TypeScript:
-- Use TypeScript for type safety in larger projects
-- Prefer const over let; never use var
-- Use arrow functions for callbacks and anonymous functions
-- Use async/await instead of raw Promises
-- Use destructuring for cleaner parameter handling
-- Prefer template literals over string concatenation
+- Use TypeScript for type safety; prefer const over let
+- Use async/await and arrow functions for callbacks
 - Use optional chaining (?.) and nullish coalescing (??)
-- Export named exports over default exports for better refactoring
-- Use ESLint and Prettier for consistent code style
+- Use destructuring for cleaner code
 
 === ERROR HANDLING ===
 - Catch specific exceptions, not bare except clauses
