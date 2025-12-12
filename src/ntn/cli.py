@@ -88,12 +88,12 @@ def parse_debug_file(filepath):
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
-    
+
     messages = []
     display_history = []
     incomplete_turn = None
     session_cost = 0.0
-    
+
     # Parse USAGE lines and calculate cost (model embedded in each usage record)
     for usage_str in re.findall(r'--- USAGE: ({.*?}) ---', content):
         try:
@@ -109,7 +109,7 @@ def parse_debug_file(filepath):
             session_cost += CodingAgent.calculate_cost_from_usage(usage_data, model)
         except (json.JSONDecodeError, ValueError):
             pass
-    
+
     # Fallback: Parse legacy REQ_COST lines (old format)
     if session_cost == 0.0:
         for cost_str in re.findall(r'--- REQ_COST: ([\d.]+) ---', content):
@@ -117,79 +117,153 @@ def parse_debug_file(filepath):
                 session_cost += float(cost_str)
             except ValueError:
                 pass
-    
-    # Split by turn markers
-    turn_splits = re.split(r'\n=== TURN \d+ ===\n', content)
-    
-    for turn_content in turn_splits[1:]:  # Skip header before first turn
+
+    # Find all compaction events with their positions and info
+    # Stop at TURN, RESUME, USAGE, or end of file
+    compaction_pattern = r'=== COMPACTION EVENT ===\nReason: .*?\nRemoved turns: (\d+)-(\d+)\nSummary content:\n(.*?)(?=\n--- USAGE:|\n=== TURN|\n=== RESUME|\Z)'
+    compaction_matches = list(re.finditer(compaction_pattern, content, re.DOTALL))
+    latest_compaction = compaction_matches[-1] if compaction_matches else None
+    latest_compaction_pos = latest_compaction.start() if latest_compaction else -1
+
+    # Find all turn start positions
+    turn_pattern = r'\n=== TURN (\d+) ===\n'
+    turn_matches = list(re.finditer(turn_pattern, content))
+
+    # If there was compaction, initialize messages with summary
+    if latest_compaction:
+        summary_text = latest_compaction.group(3).strip()
+        messages = [
+            {"role": "user", "content": summary_text},
+            {"role": "assistant", "content": [{"type": "text", "text": "I understand the context and will continue helping with your request."}]}
+        ]
+
+    # Track which compactions we've added to display
+    compactions_added = set()
+    last_pos = 0
+
+    # Process turns and insert compaction events at the right positions
+    for i, turn_match in enumerate(turn_matches):
+        turn_start = turn_match.start()
+
+        # Check if any compaction events occurred before this turn
+        for comp_idx, comp in enumerate(compaction_matches):
+            if comp_idx not in compactions_added and last_pos <= comp.start() < turn_start:
+                # Add compaction to display_history
+                removed_start, removed_end = comp.group(1), comp.group(2)
+                summary = comp.group(3).strip()
+                display_history.append(("system", f"📦 Context compacted - turns {removed_start}-{removed_end} summarized"))
+                if config.ui.show_compact_content:
+                    display_history.append(("system", summary))
+                compactions_added.add(comp_idx)
+
+        # Find turn content (until next turn or end)
+        turn_end = turn_matches[i + 1].start() if i + 1 < len(turn_matches) else len(content)
+        turn_content = content[turn_match.end():turn_end]
         turn_complete = '--- END_TURN ---' in turn_content
-        
-        # Find all blocks using findall to get ordered list of (type, content)
-        # Match: --- TYPE ---\n followed by content until next --- or === or end
-        block_pattern = r'--- (USER|ASSISTANT|TOOL_RESULT) ---\n(.*?)(?=\n--- |\n=== |$)'
-        block_matches = re.findall(block_pattern, turn_content, re.DOTALL)
-        
+
+        # Parse all markers in order (USER, ASSISTANT, TOOL_RESULT, DROP_TURN)
+        # This ensures DROP_TURN appears in the correct position in display_history
+        all_markers_pattern = r'--- (USER|ASSISTANT|TOOL_RESULT|DROP_TURN) ---'
+        marker_matches = list(re.finditer(all_markers_pattern, turn_content))
+
+        # Parse full block content for USER/ASSISTANT/TOOL_RESULT
+        full_block_pattern = r'--- (USER|ASSISTANT|TOOL_RESULT) ---\n(.*?)(?=\n--- |\n=== |$)'
+        full_block_matches = list(re.finditer(full_block_pattern, turn_content, re.DOTALL))
+
         last_assistant_content = None
         last_tool_results = None
-        
-        for block_type, block_data in block_matches:
+
+        # Check if this turn is after the latest compaction (for messages)
+        include_in_messages = turn_start > latest_compaction_pos
+
+        # Build a map of position -> full block data
+        block_data_map = {}
+        for match in full_block_matches:
+            block_data_map[match.start()] = (match.group(1), match.group(2).strip())
+
+        # Process markers in order
+        for marker_match in marker_matches:
+            marker_type = marker_match.group(1)
+            marker_pos = marker_match.start()
+
+            # Handle DROP_TURN indicator
+            if marker_type == "DROP_TURN":
+                if config.ui.show_drop_indicator:
+                    display_history.append(("system", "📦 Compacting..."))
+                continue
+
+            # Get full block data for this marker
+            if marker_pos not in block_data_map:
+                continue
+            block_type, block_data = block_data_map[marker_pos]
             block_data = block_data.strip()
-            
+
             if block_type == "USER":
-                # First USER in a turn is the actual user input (plain text)
-                messages.append({"role": "user", "content": block_data})
+                # Add to display_history always
                 display_history.append(("user", block_data))
-                    
+                # Add to messages only if after compaction
+                if include_in_messages:
+                    messages.append({"role": "user", "content": block_data})
+
             elif block_type == "ASSISTANT":
                 try:
                     assistant_content = json.loads(block_data)
-                    messages.append({"role": "assistant", "content": assistant_content})
                     last_assistant_content = assistant_content
-                    
-                    # Extract thinking indicator for display
+
+                    # Add to messages only if after compaction
+                    if include_in_messages:
+                        messages.append({"role": "assistant", "content": assistant_content})
+
+                    # Extract thinking indicator for display (always)
                     for b in assistant_content:
                         if b.get("type") == "thinking":
                             display_history.append(("thinking", "🧠 Thinking..."))
-                    
-                    # Extract text for display
+
+                    # Extract text for display (always)
                     texts = [b["text"] for b in assistant_content if b.get("type") == "text"]
                     if texts:
                         display_history.append(("assistant", "\n".join(texts)))
-                    
-                    # Extract tool descriptions for display
+
+                    # Extract tool descriptions for display (always)
                     for b in assistant_content:
                         if b.get("type") == "tool_use":
                             desc = get_tool_description(b.get("name", ""), b.get("input", {}))
                             display_history.append(("tool", desc))
                 except json.JSONDecodeError:
                     pass
-                    
+
             elif block_type == "TOOL_RESULT":
                 try:
                     tool_results = json.loads(block_data)
-                    messages.append({"role": "user", "content": tool_results})
                     last_tool_results = tool_results
+                    # Add to messages only if after compaction
+                    if include_in_messages:
+                        messages.append({"role": "user", "content": tool_results})
                 except json.JSONDecodeError:
                     pass
-        
-        # Check if turn is incomplete
-        if not turn_complete:
-            # Determine what to resume with based on last block
+
+        # Check if turn is incomplete (only matters for last turn)
+        if not turn_complete and i == len(turn_matches) - 1:
             if last_tool_results is not None:
-                # Crashed after tool execution - messages already has tool_results
-                # Just need to call API to continue generation
                 incomplete_turn = {"type": "continue"}
             elif last_assistant_content is not None:
-                # Crashed after assistant response with tool_use but before tools ran
                 tool_uses = [b for b in last_assistant_content if b.get("type") == "tool_use"]
                 if tool_uses:
-                    # Need to execute tools, then continue
                     incomplete_turn = {"type": "execute_tools", "tool_uses": tool_uses}
             elif messages and messages[-1].get("role") == "user":
-                # Crashed after user input but before assistant responded
-                # Need to call API to get response
                 incomplete_turn = {"type": "continue"}
-    
+
+        last_pos = turn_end
+
+    # Add any remaining compaction events that occurred after the last turn
+    for comp_idx, comp in enumerate(compaction_matches):
+        if comp_idx not in compactions_added:
+            summary = comp.group(3).strip()
+            display_history.append(("system", "📦 Compacting..."))
+            if config.ui.show_compact_content:
+                display_history.append(("system", summary))
+            compactions_added.add(comp_idx)
+
     return messages, display_history, incomplete_turn, session_cost
 
 
@@ -221,7 +295,8 @@ def replay_display_history(display_history):
         "user": (get_color("user"), prefixes.user),
         "thinking": (get_color("thinking"), ""),
         "assistant": (get_color("assistant"), prefixes.assistant),
-        "tool": (get_color("tool"), "")
+        "tool": (get_color("tool"), ""),
+        "system": (get_color("system"), "")
     }
     for role, content in display_history:
         color, prefix = role_formats.get(role, (Style.RESET_ALL, ""))
@@ -301,6 +376,13 @@ def main():
         if display_history:
             print(f"{Fore.CYAN}--- Previous conversation ---{Style.RESET_ALL}\n")
             replay_display_history(display_history)
+            # Only add divider if replay_display_history didn't already add one
+            # (it adds divider after "user" and "assistant" entries)
+            last_role = display_history[-1][0] if display_history else None
+            if last_role not in ("user", "assistant"):
+                print()
+                print_divider()
+                print()
             print(f"{Fore.CYAN}--- Resuming conversation ---{Style.RESET_ALL}\n")
         else:
             print(f"{Fore.YELLOW}No conversation history found in debug file")

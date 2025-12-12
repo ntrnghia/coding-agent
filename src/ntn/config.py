@@ -102,6 +102,8 @@ class UIConfig:
     """UI display configuration."""
 
     divider_width: int
+    show_compact_content: bool
+    show_drop_indicator: bool
     prefixes: PrefixesConfig
     colors: ColorsConfig
 
@@ -212,6 +214,8 @@ def _load_config() -> Config:
 
     ui = UIConfig(
         divider_width=data["ui"]["divider_width"],
+        show_compact_content=data["ui"]["show_compact_content"],
+        show_drop_indicator=data["ui"]["show_drop_indicator"],
         prefixes=PrefixesConfig(**data["ui"]["prefixes"]),
         colors=ColorsConfig(**data["ui"]["colors"]),
     )

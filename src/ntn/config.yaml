@@ -32,7 +32,7 @@ models:
       max_context_tokens: 200000
       max_output_tokens: 64000
     gpt-5.2:
-      max_context_tokens: 400000
+      max_context_tokens: 400000  # Actual OpenAI API limit
       max_output_tokens: 128000
 
   # Per-model extended thinking budget
@@ -79,6 +79,8 @@ docker:
 # UI settings
 ui:
   divider_width: 80
+  show_compact_content: true  # Show compaction summary content
+  show_drop_indicator: true   # Show indicator when dropping turns due to context overflow
 
   # Display prefixes
   prefixes:

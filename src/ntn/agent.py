@@ -218,30 +218,16 @@ class CodingAgent:
     # Model configurations from centralized config
     MODELS = config.models.aliases
 
-    # Summarization request template
-    SUMMARIZATION_TEMPLATE = """Summarize the conversation above into a concise context, then answer the current question.
+    # Summarization request template (summary only, no answer)
+    SUMMARIZATION_TEMPLATE = """Summarize the conversation above.
 
-Preserve in summary:
-- Key decisions made and their rationale
-- Important file changes and current state
-- Any relevant context for the current question
+Preserve:
+- Key decisions and rationale
+- Important file contents and tool outputs
+- Important code snippets and file paths
+- Some agent mistakes to avoid
 
-Remove from summary:
-- Verbose tool outputs (just note what was done)
-- Failed attempts (unless informative)
-- Exploratory discussions not relevant to current question
-
-Current question to answer:
-{current_question}
-
-Provide your response in this format:
-[SUMMARY]
-(Your concise summary of the conversation)
-[/SUMMARY]
-
-[ANSWER]
-(Your answer to the current question)
-[/ANSWER]"""
+You may use formatting (headers, code blocks, lists) to organize the summary."""
 
     def __init__(self, tools, workspace_dir, debug_file=None, container_info=None, stream=False, think=False, model="gpt"):
         # Store shorthand and resolve to full model ID
@@ -277,6 +263,9 @@ Provide your response in this format:
         self.run_cost = 0.0  # Cost since current run started (resets on resume)
         self.last_req_cost = 0.0  # Cost of last API request
         self.last_usage = None  # Last API usage tokens (for logging)
+
+        # Context management
+        self._dropped_turns_this_turn = False  # Track if we dropped turns due to context overflow
         
         # Setup debug log file and container
         if debug_file:
@@ -519,7 +508,7 @@ Provide your response in this format:
         """Split messages into turns (each turn starts with a user message)"""
         turns = []
         current_turn = []
-        
+
         for msg in self.messages:
             if msg["role"] == "user" and current_turn:
                 # Check if this is a tool_result (part of current turn) or new user input
@@ -533,97 +522,86 @@ Provide your response in this format:
                     current_turn = [msg]
             else:
                 current_turn.append(msg)
-        
+
         if current_turn:
             turns.append(current_turn)
-        
+
         return turns
 
-    def _compact_context(self, new_user_input):
-        """Compact context when exceeding token limit. Returns True if compaction succeeded."""
-        turns = self._get_turns()
-        
-        if len(turns) < 2:
-            # Can't compact with less than 2 turns
-            print(f"{Fore.RED}⚠️ Cannot compact: conversation too short{Style.RESET_ALL}")
-            return False
-        
-        # Build summarization request with current question
-        sr = self.SUMMARIZATION_TEMPLATE.format(current_question=new_user_input)
-        sr_message = {"role": "user", "content": sr}
-        
-        # Try removing oldest turns until SR fits
-        for i in range(1, len(turns)):
-            # Keep turns from index i onwards, plus SR
-            remaining_turns = turns[i:]
-            candidate_messages = []
-            for turn in remaining_turns:
-                candidate_messages.extend(turn)
-            candidate_messages.append(sr_message)
-            
-            token_count = self._count_tokens(candidate_messages)
-            
-            if token_count <= self.max_context_tokens - self.max_output_tokens:
-                # This fits! Get summary
-                print(f"{Fore.YELLOW}⚠️ Context limit approaching. Compacting conversation history...{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}📊 Removing {i} oldest turn(s) and creating summary...{Style.RESET_ALL}")
-                
-                try:
-                    # Call API with candidate messages to get summary
-                    tool_schemas = [tool.get_schema() for tool in self.tools]
-                    summary_response = self.provider.create(
-                        messages=candidate_messages,
-                        system=self.system_prompt,
-                        tools=tool_schemas,
-                        max_tokens=self.max_output_tokens
-                    )
+    def _drop_oldest_turn(self, tokens_to_remove=None, tokens_used=None):
+        """Drop oldest turn(s) from messages. Returns True if successful.
 
-                    # Extract summary content from normalized response
-                    summary_text = ""
-                    for block in summary_response.content:
-                        if block.get("type") == "text":
-                            summary_text += block.get("text", "")
-                    
-                    # Log compaction
-                    self._log_compaction(
-                        f"Exceeded context ({token_count} tokens attempted)",
-                        f"1-{i}",
-                        summary_text
-                    )
-                    
-                    # Replace messages with summary as single user message
-                    self.messages = [{"role": "user", "content": summary_text}]
-                    
-                    # Add the assistant acknowledgment so conversation can continue
-                    self.messages.append({
-                        "role": "assistant", 
-                        "content": [{"type": "text", "text": "I understand the context and will continue helping with your request."}]
-                    })
-                    
-                    print(f"{Fore.GREEN}✓ Context compacted successfully{Style.RESET_ALL}")
-                    return True
-                    
-                except Exception as e:
-                    print(f"{Fore.RED}⚠️ Compaction failed: {e}{Style.RESET_ALL}")
-                    self._log_raw(f"Compaction error: {e}")
-                    continue
-        
-        print(f"{Fore.RED}⚠️ Cannot compact: all attempts exceeded context limit{Style.RESET_ALL}")
-        return False
+        Args:
+            tokens_to_remove: If specified, drop enough turns to remove this many tokens.
+                              If None, drops 1 turn.
+            tokens_used: Actual token count from API error (for accurate avg calculation).
+        """
+        return self._drop_multiple_oldest_turns(tokens_to_remove, tokens_used) > 0
 
-    def _check_and_compact_if_needed(self, new_user_input):
-        """Check if adding new input would exceed context, compact if needed"""
-        # Build candidate messages
-        candidate_messages = self.messages.copy()
-        candidate_messages.append({"role": "user", "content": new_user_input})
-        
-        token_count = self._count_tokens(candidate_messages)
-        
-        # Reserve space for output
-        if token_count > self.max_context_tokens - self.max_output_tokens:
-            return self._compact_context(new_user_input)
-        
-        return True  # No compaction needed
+    def _compact_after_turn(self):
+        """Compact context after a turn completes (called when we dropped turns during the turn)."""
+        # Divider after agent response, before compacting
+        print()
+        print_divider()
+        print()
+        print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
+
+        # Build summarization request
+        sr_message = {"role": "user", "content": self.SUMMARIZATION_TEMPLATE}
+        messages_with_sr = self.messages + [sr_message]
+
+        try:
+            # Call API with streaming (required for long operations)
+            tool_schemas = [tool.get_schema() for tool in self.tools]
+            stream_gen = self.provider.stream(
+                messages=messages_with_sr,
+                system=self.system_prompt,
+                tools=tool_schemas,
+                max_tokens=self.max_output_tokens
+            )
+
+            # Consume stream and collect text content
+            summary_text = ""
+            final_response = None
+            try:
+                while True:
+                    event = next(stream_gen)
+                    if event.type == "text_delta":
+                        summary_text += event.data
+            except StopIteration as e:
+                final_response = e.value
+
+            # Track cost from compaction request
+            if final_response:
+                self._capture_rate_limit_info(final_response)
+
+            # Log compaction with usage
+            num_turns = len(self._get_turns())
+            self._log_compaction(
+                "Post-turn compaction after context overflow",
+                f"1-{num_turns}",
+                summary_text
+            )
+            self._log_raw("")  # Blank line separator
+            self._log_req_cost()  # Log USAGE after compaction event
+
+            # Replace messages with summary as single user message
+            self.messages = [{"role": "user", "content": summary_text}]
+
+            # Add the assistant acknowledgment so conversation can continue
+            self.messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I understand the context and will continue helping with your request."}]
+            })
+
+            # Display summary if configured
+            if config.ui.show_compact_content:
+                print(f"{get_color('system')}{summary_text}{Style.RESET_ALL}")
+            # No divider here - print_status() will add one
+
+        except Exception as e:
+            print(f"{Fore.RED}⚠️ Compaction failed: {e}{Style.RESET_ALL}")
+            self._log_raw(f"Compaction error: {e}")
 
     def chat(self, message):
         """Send message to LLM and update messages array"""
@@ -632,15 +610,129 @@ Provide your response in this format:
         self.messages.append({"role": "assistant", "content": content_list})
         return response
     
+    def _is_context_error(self, error):
+        """Check if error is a context length exceeded error."""
+        error_str = str(error).lower()
+        return any(x in error_str for x in [
+            "context_length_exceeded",
+            "max_tokens",
+            "too many tokens",
+            "too long",  # Anthropic: "prompt is too long"
+            "maximum context length",
+            "context window",
+            "exceed"
+        ])
+
+    def _parse_context_error(self, error):
+        """Parse token counts from context length error message.
+
+        OpenAI errors typically look like:
+        "This model's maximum context length is 400000 tokens. However, your messages resulted in 450000 tokens."
+
+        Anthropic errors look like:
+        "prompt is too long: 208930 tokens > 200000 maximum"
+
+        Returns:
+            tuple: (tokens_used, tokens_limit) or (None, None) if cannot parse
+        """
+        error_str = str(error)
+
+        # Try Anthropic format first: "208930 tokens > 200000 maximum"
+        anthropic_match = re.search(r'(\d+) tokens > (\d+) maximum', error_str)
+        if anthropic_match:
+            return int(anthropic_match.group(1)), int(anthropic_match.group(2))
+
+        # Try OpenAI format: "resulted in 450000 tokens" and "maximum context length is 400000"
+        used_match = re.search(r'resulted in (\d+) tokens', error_str)
+        if not used_match:
+            used_match = re.search(r'(\d+) tokens.*(?:exceed|over)', error_str, re.IGNORECASE)
+
+        limit_match = re.search(r'maximum context length is (\d+)', error_str)
+        if not limit_match:
+            limit_match = re.search(r'max.*?(\d+) tokens', error_str, re.IGNORECASE)
+
+        tokens_used = int(used_match.group(1)) if used_match else None
+        tokens_limit = int(limit_match.group(1)) if limit_match else None
+
+        return tokens_used, tokens_limit
+
+    def _estimate_tokens_per_turn(self, total_tokens=None):
+        """Estimate average tokens per turn based on current messages.
+
+        Args:
+            total_tokens: If provided, use this as total (from API error message).
+                          Otherwise, calculate using provider's count_tokens.
+        """
+        turns = self._get_turns()
+        if len(turns) < 2:
+            return 10000  # Default estimate if only 1 turn
+
+        # Use provided total or calculate
+        if total_tokens is None:
+            total_tokens = self._count_tokens(self.messages)
+
+        return max(1, total_tokens // len(turns))
+
+    def _drop_multiple_oldest_turns(self, tokens_to_remove=None, tokens_used=None):
+        """Drop oldest turns to remove at least tokens_to_remove tokens.
+
+        Args:
+            tokens_to_remove: Target tokens to remove. If None, drops 1 turn.
+            tokens_used: Actual token count from API error (for accurate avg calculation).
+
+        Returns:
+            int: Number of turns actually dropped, 0 if cannot drop
+        """
+        turns = self._get_turns()
+        if len(turns) < 2:
+            return 0  # Can't drop if less than 2 turns
+
+        # If no target specified, drop 1 turn
+        if tokens_to_remove is None or tokens_to_remove <= 0:
+            first_turn_len = len(turns[0])
+            self.messages = self.messages[first_turn_len:]
+            self._dropped_turns_this_turn = True
+            self._log_raw(f"--- DROP_TURN ---")
+            if config.ui.show_drop_indicator:
+                print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
+            return 1
+
+        # Use actual token count from API error for accurate estimation
+        avg_tokens_per_turn = self._estimate_tokens_per_turn(tokens_used)
+
+        # Use ceiling division and add buffer for safety
+        # Old turns might be smaller than average, so we add 50% buffer
+        tokens_with_buffer = int(tokens_to_remove * 1.5)
+        turns_to_drop = max(1, -(-tokens_with_buffer // avg_tokens_per_turn))  # Ceiling division
+
+        # Don't drop more than available (keep at least 1 turn)
+        turns_to_drop = min(turns_to_drop, len(turns) - 1)
+
+        # Calculate total messages to remove
+        messages_to_remove = sum(len(turns[i]) for i in range(turns_to_drop))
+        self.messages = self.messages[messages_to_remove:]
+        self._dropped_turns_this_turn = True
+
+        # Log single DROP_TURN marker (not one per turn)
+        self._log_raw(f"--- DROP_TURN ---")
+
+        if config.ui.show_drop_indicator:
+            print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
+
+        return turns_to_drop
+
     def _call_api(self, print_text=True):
         """Call LLM API with current messages. Does NOT modify self.messages.
-        
-        Implements retry using retry-after header for rate limit errors.
+
+        Implements retry for:
+        - Rate limit errors: using retry-after header
+        - Context length errors: by dropping oldest turn and retrying
+
         Supports streaming and extended thinking based on instance flags.
-        
+
         Args:
             print_text: Whether to print text responses (True for run(), False for chat())
-        
+
         Returns:
             tuple: (response, content_list) where content_list is serializable format
         """
@@ -655,151 +747,189 @@ Provide your response in this format:
                 "budget_tokens": self.thinking_budget
             }
 
-        for attempt in range(max_retries + 1):
-            try:
-                if self.stream:
-                    return self._call_api_streaming(print_text, thinking_config)
-                else:
-                    response = self.provider.create(
-                        messages=self.messages,
-                        system=self.system_prompt,
-                        tools=tool_schemas,
-                        max_tokens=self.max_output_tokens,
-                        thinking_config=thinking_config
-                    )
-                    break  # Success, exit retry loop
-            except Exception as e:
-                # Handle rate limit errors for both providers
-                error_str = str(e).lower()
-                if "rate" in error_str or "429" in error_str:
-                    if attempt == max_retries:
-                        print(f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}")
+        while True:
+            for attempt in range(max_retries + 1):
+                try:
+                    if self.stream:
+                        return self._call_api_streaming(print_text, thinking_config)
+                    else:
+                        response = self.provider.create(
+                            messages=self.messages,
+                            system=self.system_prompt,
+                            tools=tool_schemas,
+                            max_tokens=self.max_output_tokens,
+                            thinking_config=thinking_config
+                        )
+                        # Success - capture rate limit info and return
+                        self._capture_rate_limit_info(response)
+                        content_list = response.content
+                        if print_text:
+                            self._print_content(content_list)
+                        return response, content_list
+                except Exception as e:
+                    error_str = str(e).lower()
+
+                    # Handle context length errors - drop oldest turn(s) and retry
+                    if self._is_context_error(e):
+                        # Try to parse token counts to drop multiple turns at once
+                        tokens_used, tokens_limit = self._parse_context_error(e)
+                        tokens_to_remove = None
+                        if tokens_used:
+                            # Use effective input limit (must reserve space for output)
+                            effective_limit = self.max_context_tokens - self.max_output_tokens
+                            tokens_to_remove = tokens_used - effective_limit
+                        if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
+                            print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
+                            raise
+                        # Break inner loop to retry with dropped turn(s)
+                        break
+
+                    # Handle rate limit errors
+                    if "rate" in error_str or "429" in error_str:
+                        if attempt == max_retries:
+                            print(f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}")
+                            raise
+                        # Get retry-after from response headers if available, fallback to 30s
+                        retry_after = None
+                        if hasattr(e, 'response') and e.response is not None:
+                            retry_after = getattr(e.response.headers, 'get', lambda x: None)("retry-after")
+                        delay = int(retry_after) if retry_after else 30
+                        print(f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}")
+                        time.sleep(delay)
+                    else:
                         raise
-                    # Get retry-after from response headers if available, fallback to 30s
-                    retry_after = None
-                    if hasattr(e, 'response') and e.response is not None:
-                        retry_after = getattr(e.response.headers, 'get', lambda x: None)("retry-after")
-                    delay = int(retry_after) if retry_after else 30
-                    print(f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}")
-                    time.sleep(delay)
-                else:
-                    raise
+            else:
+                # Inner loop completed without break - shouldn't reach here for non-streaming
+                # (non-streaming returns directly on success)
+                break
 
-        # Capture rate limit info from response headers
-        self._capture_rate_limit_info(response)
-
-        # Content is already in normalized format from provider
-        content_list = response.content
-        if print_text:
-            self._print_content(content_list)
-        return response, content_list
-    
     def _call_api_streaming(self, print_text=True, thinking_config=None):
         """Handle streaming API call with real-time text output.
 
         Text is streamed character-by-character.
         Tool use blocks are accumulated and shown when complete.
         Thinking blocks just show "Thinking..." indicator.
-        """
-        content_list = []
-        current_text = ""
-        current_thinking = ""
-        current_thinking_signature = ""
-        current_tool_use = None
-        tool_input_json = ""
-        thinking_shown = False
-        text_started = False
 
+        Handles context length errors by dropping oldest turn and retrying.
+        """
         tool_schemas = [tool.get_schema() for tool in self.tools]
 
-        # Get stream generator from provider
-        stream_gen = self.provider.stream(
-            messages=self.messages,
-            system=self.system_prompt,
-            tools=tool_schemas,
-            max_tokens=self.max_output_tokens,
-            thinking_config=thinking_config
-        )
+        while True:  # Retry loop for context errors
+            # Reset state for each attempt
+            content_list = []
+            current_text = ""
+            current_thinking = ""
+            current_thinking_signature = ""
+            current_tool_use = None
+            tool_input_json = ""
+            thinking_shown = False
+            text_started = False
+            final_response = None
 
-        final_response = None
-        # Use manual iteration to capture generator's return value
-        # (for loop discards StopIteration.value)
-        try:
-            while True:
-                event = next(stream_gen)
+            try:
+                # Get stream generator from provider
+                stream_gen = self.provider.stream(
+                    messages=self.messages,
+                    system=self.system_prompt,
+                    tools=tool_schemas,
+                    max_tokens=self.max_output_tokens,
+                    thinking_config=thinking_config
+                )
 
-                if event.type == "thinking_start":
-                    current_thinking = ""
-                    current_thinking_signature = ""
-                    if not thinking_shown and print_text:
-                        print(f"{get_color('thinking')}Thinking...{Style.RESET_ALL}")
-                        thinking_shown = True
+                # Use manual iteration to capture generator's return value
+                # (for loop discards StopIteration.value)
+                try:
+                    while True:
+                        event = next(stream_gen)
 
-                elif event.type == "text_start":
-                    if print_text:
-                        print(f"{get_color('assistant')}{config.ui.prefixes.assistant}{Style.RESET_ALL} ", end="", flush=True)
-                    text_started = True
+                        if event.type == "thinking_start":
+                            current_thinking = ""
+                            current_thinking_signature = ""
+                            if not thinking_shown and print_text:
+                                print(f"{get_color('thinking')}Thinking...{Style.RESET_ALL}")
+                                thinking_shown = True
 
-                elif event.type == "tool_use_start":
-                    current_tool_use = {
-                        "id": event.data["id"],
-                        "name": event.data["name"],
-                        "input": {}
-                    }
-                    tool_input_json = ""
+                        elif event.type == "text_start":
+                            if print_text:
+                                print(f"{get_color('assistant')}{config.ui.prefixes.assistant}{Style.RESET_ALL} ", end="", flush=True)
+                            text_started = True
 
-                elif event.type == "thinking_delta":
-                    current_thinking += event.data
+                        elif event.type == "tool_use_start":
+                            current_tool_use = {
+                                "id": event.data["id"],
+                                "name": event.data["name"],
+                                "input": {}
+                            }
+                            tool_input_json = ""
 
-                elif event.type == "signature_delta":
-                    current_thinking_signature += event.data
+                        elif event.type == "thinking_delta":
+                            current_thinking += event.data
 
-                elif event.type == "text_delta":
-                    current_text += event.data
-                    if print_text:
-                        print(f"{get_color('assistant')}{event.data}", end="", flush=True)
+                        elif event.type == "signature_delta":
+                            current_thinking_signature += event.data
 
-                elif event.type == "tool_input_delta":
-                    tool_input_json += event.data
+                        elif event.type == "text_delta":
+                            current_text += event.data
+                            if print_text:
+                                print(f"{get_color('assistant')}{event.data}", end="", flush=True)
 
-                elif event.type == "content_block_stop":
-                    # Store thinking block if we accumulated any
-                    if current_thinking or current_thinking_signature:
-                        thinking_block = {"type": "thinking", "thinking": current_thinking}
-                        if current_thinking_signature:
-                            thinking_block["signature"] = current_thinking_signature
-                        content_list.append(thinking_block)
-                        current_thinking = ""
-                        current_thinking_signature = ""
-                    if current_text:
-                        content_list.append({"type": "text", "text": current_text})
-                        if print_text and text_started:
-                            print(Style.RESET_ALL)
-                        current_text = ""
-                        text_started = False
-                    if current_tool_use:
-                        try:
-                            current_tool_use["input"] = json.loads(tool_input_json) if tool_input_json else {}
-                        except json.JSONDecodeError:
-                            current_tool_use["input"] = {}
-                        content_list.append({
-                            "type": "tool_use",
-                            "id": current_tool_use["id"],
-                            "name": current_tool_use["name"],
-                            "input": current_tool_use["input"]
-                        })
-                        current_tool_use = None
-                        tool_input_json = ""
+                        elif event.type == "tool_input_delta":
+                            tool_input_json += event.data
 
-        except StopIteration as e:
-            final_response = e.value
+                        elif event.type == "content_block_stop":
+                            # Store thinking block if we accumulated any
+                            if current_thinking or current_thinking_signature:
+                                thinking_block = {"type": "thinking", "thinking": current_thinking}
+                                if current_thinking_signature:
+                                    thinking_block["signature"] = current_thinking_signature
+                                content_list.append(thinking_block)
+                                current_thinking = ""
+                                current_thinking_signature = ""
+                            if current_text:
+                                content_list.append({"type": "text", "text": current_text})
+                                if print_text and text_started:
+                                    print(Style.RESET_ALL)
+                                current_text = ""
+                                text_started = False
+                            if current_tool_use:
+                                try:
+                                    current_tool_use["input"] = json.loads(tool_input_json) if tool_input_json else {}
+                                except json.JSONDecodeError:
+                                    current_tool_use["input"] = {}
+                                content_list.append({
+                                    "type": "tool_use",
+                                    "id": current_tool_use["id"],
+                                    "name": current_tool_use["name"],
+                                    "input": current_tool_use["input"]
+                                })
+                                current_tool_use = None
+                                tool_input_json = ""
 
-        # Update content in response
-        if final_response:
-            final_response.content = content_list
-            self._capture_rate_limit_info(final_response)
+                except StopIteration as e:
+                    final_response = e.value
 
-        return final_response, content_list
+                # Success - return response
+                if final_response:
+                    final_response.content = content_list
+                    self._capture_rate_limit_info(final_response)
+                return final_response, content_list
+
+            except Exception as e:
+                # Handle context length errors - drop oldest turn(s) and retry
+                if self._is_context_error(e):
+                    # Try to parse token counts to drop multiple turns at once
+                    tokens_used, tokens_limit = self._parse_context_error(e)
+                    tokens_to_remove = None
+                    if tokens_used:
+                        # Use effective input limit (must reserve space for output)
+                        effective_limit = self.max_context_tokens - self.max_output_tokens
+                        tokens_to_remove = tokens_used - effective_limit
+                    if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
+                        print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
+                        raise
+                    # Continue to retry with dropped turn(s)
+                    continue
+                raise
     
     def _capture_rate_limit_info(self, response):
         """Capture rate limit info from API response and calculate cost."""
@@ -892,13 +1022,15 @@ Provide your response in this format:
             output_str = "N/A"
         
         rate_line = f"📊 Requests: {req_str} | Input: {input_str} | Output: {output_str}"
-        
-        # Context usage - always calculate current tokens for accurate display
+
+        # Context usage - show effective input limit (max_context - max_output)
+        # This is the actual input limit because output tokens must be reserved
         if self.messages:
             self.context_tokens = self._count_tokens(self.messages)
-        
-        context_pct = (self.context_tokens / self.max_context_tokens) * 100
-        context_line = f"🧠 Context: {self.context_tokens:,}/{self.max_context_tokens:,} ({context_pct:.0f}%)"
+
+        effective_limit = self.max_context_tokens - self.max_output_tokens
+        context_pct = (self.context_tokens / effective_limit) * 100
+        context_line = f"🧠 Context: {self.context_tokens:,}/{effective_limit:,} ({context_pct:.0f}%)"
         
         # Print separator and box
         print()  # Blank line for spacing
@@ -1032,37 +1164,43 @@ Provide your response in this format:
 
     def run(self, user_input, max_turns=None, initial_messages=None, display_history=None):
         """Main agent loop
-        
+
         Args:
             user_input: The user's input message
             max_turns: Maximum number of tool-use turns
             initial_messages: Optional messages to restore from a previous session
             display_history: Optional display history for resume functionality
         """
+        # Reset dropped turns flag for this turn
+        self._dropped_turns_this_turn = False
+
         # Initialize from previous session if provided
         if initial_messages is not None:
             self.messages = initial_messages
         if display_history is not None:
             self.display_history = display_history
-        
+
         # Store original user input for display history
         self.display_history.append(("user", user_input))
-        
+
         # If thinking is enabled, ensure all assistant messages have thinking blocks
         if self.think and self.messages:
             self._ensure_thinking_blocks()
-        
-        # Check and compact if needed before processing
-        if self.messages and not self._check_and_compact_if_needed(user_input):
-            print(f"{Fore.RED}Failed to process due to context limit{Style.RESET_ALL}")
-            return None
-        
+
         turn_num = len([h for h in self.display_history if h[0] == "user"])
         self._log_turn_start(turn_num, user_input)
 
         if max_turns is None:
             max_turns = config.agent.max_turns
-        return self._agent_loop(user_input, max_turns)
+
+        response = self._agent_loop(user_input, max_turns)
+
+        # Compact context if we dropped turns during this turn
+        if self._dropped_turns_this_turn:
+            self._compact_after_turn()
+            self._dropped_turns_this_turn = False
+
+        return response
 
     def _agent_loop(self, initial_input, max_turns):
         """Core agent loop for processing messages and tool calls.

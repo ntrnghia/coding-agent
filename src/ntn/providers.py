@@ -395,28 +395,78 @@ class OpenAIProvider(BaseProvider):
     def count_tokens(
         self, messages: List[Dict], system: str, tools: List[Dict]
     ) -> int:
-        """Count tokens using tiktoken."""
-        token_count = 0
+        """Count tokens using OpenAI's official formula.
 
-        # Count system message
-        token_count += len(self.encoding.encode(system))
+        Based on: https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken
+        """
+        num_tokens = 0
 
-        # Count messages
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                token_count += len(self.encoding.encode(content))
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        token_count += len(self.encoding.encode(json.dumps(item)))
+        # System message (counts as a message with role + content)
+        num_tokens += 3  # tokens_per_message for system
+        num_tokens += len(self.encoding.encode(system))
 
-        # Count tools (rough estimate)
+        # Count messages using official formula
+        for message in messages:
+            num_tokens += 3  # tokens_per_message
+            for key, value in message.items():
+                if isinstance(value, str):
+                    num_tokens += len(self.encoding.encode(value))
+                elif isinstance(value, list):
+                    # Tool results/content blocks - encode each item's text content
+                    for item in value:
+                        if isinstance(item, dict):
+                            # Extract text content, not JSON
+                            if "text" in item:
+                                num_tokens += len(self.encoding.encode(item["text"]))
+                            elif "content" in item:
+                                num_tokens += len(self.encoding.encode(str(item["content"])))
+                            else:
+                                # Fallback for other dict types (tool_use, thinking, etc.)
+                                num_tokens += len(self.encoding.encode(json.dumps(item)))
+                if key == "name":
+                    num_tokens += 1
+
+        num_tokens += 3  # Reply priming
+
+        # Count tools using model-specific overhead
         if tools:
-            token_count += len(self.encoding.encode(json.dumps(tools)))
+            num_tokens += self._count_tool_tokens(tools)
 
-        # Add overhead for message formatting
-        token_count += len(messages) * 4
+        return num_tokens
+
+    def _count_tool_tokens(self, tools: List[Dict]) -> int:
+        """Count tokens for tool definitions using OpenAI's format.
+
+        OpenAI converts tools to TypeScript internally. Uses model-specific overhead values.
+        Based on: https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken
+        """
+        # Use gpt-4o overhead values
+        func_init, prop_init, prop_key, func_end = 7, 3, 3, 12
+        enum_init, enum_item = -3, 3
+
+        token_count = 0
+        for tool in tools:
+            token_count += func_init
+            name = tool.get("name", "")
+            desc = tool.get("description", "").rstrip(".")
+            token_count += len(self.encoding.encode(f"{name}:{desc}"))
+
+            params = tool.get("input_schema", {}).get("properties", {})
+            if params:
+                token_count += prop_init
+                for key, prop in params.items():
+                    token_count += prop_key
+                    p_type = prop.get("type", "")
+                    p_desc = prop.get("description", "").rstrip(".")
+                    token_count += len(self.encoding.encode(f"{key}:{p_type}:{p_desc}"))
+
+                    if "enum" in prop:
+                        token_count += enum_init
+                        for item in prop["enum"]:
+                            token_count += enum_item
+                            token_count += len(self.encoding.encode(item))
+
+            token_count += func_end
 
         return token_count
 
