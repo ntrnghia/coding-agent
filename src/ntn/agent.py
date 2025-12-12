@@ -296,6 +296,8 @@ Provide your response in this format:
                 container_name=container_name,
                 working_dirs=working_dirs
             )
+            # Track what was already logged (from previous session)
+            self._last_logged_container_info = container_info
             self._log_resume()
         else:
             # New session: create new debug file
@@ -309,6 +311,8 @@ Provide your response in this format:
                 container_name=f"agent_{timestamp}",
                 working_dirs=[workspace_dir]  # Auto-mount workspace
             )
+            # Track what was logged (None = nothing yet)
+            self._last_logged_container_info = None
             self._log_session_start()
         
         # Start container with workspace mounted
@@ -402,13 +406,16 @@ Always verify your actions and explain what you're doing."""
         return result
     
     def _log_container_info(self):
-        """Log container info to debug file for resume"""
+        """Log container info to debug file only if changed since last log"""
         info = {
             "container_name": self.container_manager.container_name,
             "working_dirs": self.container_manager.working_dirs
         }
-        self._log_raw(f"\n=== CONTAINER INFO ===")
-        self._log_raw(json.dumps(info))
+        # Only log if different from last logged info
+        if info != self._last_logged_container_info:
+            self._log_raw(f"\n=== CONTAINER INFO ===")
+            self._log_raw(json.dumps(info))
+            self._last_logged_container_info = info
     
     def cleanup_empty_session(self):
         """Clean up if no user messages. Returns True if cleaned up."""
@@ -444,13 +451,11 @@ Always verify your actions and explain what you're doing."""
         self._log_raw(f"Workspace: {self.workspace_dir}")
         self._log_raw(f"Model: {self.model}")
         self._log_raw(f"Container: {self.container_manager.container_name}")
-        self._log_raw("")
 
     def _log_resume(self):
         """Log resume marker"""
         self._log_raw(f"\n=== RESUME ===")
         self._log_raw(f"Timestamp: {datetime.now().isoformat()}")
-        self._log_raw("")
 
     def _log_raw(self, message):
         """Write raw message to log file"""
@@ -492,7 +497,6 @@ Always verify your actions and explain what you're doing."""
         self._log_raw(f"Reason: {reason}")
         self._log_raw(f"Removed turns: {removed_turns}")
         self._log_raw(f"Summary content:\n{summary_content}")
-        self._log_raw("")
 
     def _get_tool_schemas(self):
         """Get tool schemas with cache_control on the last tool for prompt caching."""

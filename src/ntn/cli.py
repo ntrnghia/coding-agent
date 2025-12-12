@@ -328,7 +328,7 @@ def main():
     if not args.resume:
         print(f"{Fore.GREEN}Coding Agent initialized in: {workspace}")
     print(f"{Fore.CYAN}Debug logs: {agent.debug_file}")
-    print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
+    # print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
     
     # Show enabled features
     if args.think:
