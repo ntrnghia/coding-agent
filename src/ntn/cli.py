@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NTN CLI - Minimal AI coding agent powered by Claude"""
+"""NTN CLI - Minimal AI coding agent"""
 import os
 import sys
 import argparse
@@ -11,6 +11,7 @@ from colorama import Fore, Style, init
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
+from .config import config
 from .tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
 from .agent import CodingAgent, print_divider
 
@@ -24,7 +25,7 @@ def create_key_bindings():
     
     # Track backslash timing for Shift+Enter detection
     state = {'last_backslash_time': 0}
-    SHIFT_ENTER_THRESHOLD = 0.05  # 50ms - if Enter comes within this time after \, it's Shift+Enter
+    SHIFT_ENTER_THRESHOLD = config.cli.shift_enter_threshold
 
     @bindings.add('enter')
     def handle_enter(event):
@@ -93,14 +94,19 @@ def parse_debug_file(filepath):
     incomplete_turn = None
     session_cost = 0.0
     
-    # Parse model from session header (default to opus if not found)
-    model_match = re.search(r'Model: (claude-[\w-]+)', content)
-    model = model_match.group(1) if model_match else "claude-opus-4-5"
-    
-    # Parse USAGE lines (new format) and calculate cost
+    # Parse USAGE lines and calculate cost (model embedded in each usage record)
     for usage_str in re.findall(r'--- USAGE: ({.*?}) ---', content):
         try:
-            session_cost += CodingAgent.calculate_cost_from_usage(json.loads(usage_str), model)
+            usage_data = json.loads(usage_str)
+            # Get model shorthand from usage record, resolve to full model ID
+            model_short = usage_data.pop("model", None)
+            if model_short:
+                model = config.models.get_model_id(model_short)
+            else:
+                # Fallback: parse from session header (legacy format)
+                model_match = re.search(r'Model: ([\w.-]+)', content)
+                model = model_match.group(1) if model_match else "gpt-5.2"
+            session_cost += CodingAgent.calculate_cost_from_usage(usage_data, model)
         except (json.JSONDecodeError, ValueError):
             pass
     
@@ -227,7 +233,6 @@ def replay_display_history(display_history):
         # Add divider after user message
         if role == "user":
             print(); print_divider(); print()
-    print()
 
 
 def parse_arguments():
@@ -247,22 +252,29 @@ def parse_arguments():
     )
     parser.add_argument(
         '-m', '--model',
-        choices=['opus', 'sonnet', 'haiku'],
-        default='opus',
-        help='Model to use: opus (default), sonnet, or haiku'
+        choices=['gpt', 'opus', 'sonnet', 'haiku'],
+        default='gpt',
+        help='Model to use: gpt (default), opus, sonnet, or haiku'
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
-    
-    # Check for API key
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{Fore.RED}ERROR: ANTHROPIC_API_KEY environment variable not set!")
-        print(f"{Fore.YELLOW}Set it with: export ANTHROPIC_API_KEY='your-key-here'")
-        print(f"{Fore.YELLOW}Or create a .env file with: ANTHROPIC_API_KEY=your-key-here")
-        return
+
+    # Check for API key based on model
+    if args.model == 'gpt':
+        if not os.getenv("OPENAI_API_KEY"):
+            print(f"{Fore.RED}ERROR: OPENAI_API_KEY environment variable not set!")
+            print(f"{Fore.YELLOW}Set it with: export OPENAI_API_KEY='your-key-here'")
+            print(f"{Fore.YELLOW}Or create a .env file with: OPENAI_API_KEY=your-key-here")
+            return
+    else:
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            print(f"{Fore.RED}ERROR: ANTHROPIC_API_KEY environment variable not set!")
+            print(f"{Fore.YELLOW}Set it with: export ANTHROPIC_API_KEY='your-key-here'")
+            print(f"{Fore.YELLOW}Or create a .env file with: ANTHROPIC_API_KEY=your-key-here")
+            return
 
     # Set workspace directory
     workspace = os.getcwd()
@@ -313,7 +325,7 @@ def main():
         workspace_dir=workspace,
         debug_file=resume_file,  # None for new session, path for resume
         container_info=container_info,  # None for new session, dict for resume
-        stream=True,  # Always stream (required for Opus 4.5 with large output)
+        stream=True,  # Always stream for real-time output
         think=args.think,
         model=args.model
     )
@@ -342,7 +354,8 @@ def main():
     # print(f"{Fore.CYAN}Container: {agent.container_manager.container_name}")
     
     # Show enabled features
-    features = [f"model: {args.model}"]
+    model_display = f"{args.model} (gpt-5.2)" if args.model == 'gpt' else args.model
+    features = [f"model: {model_display}"]
     if args.think:
         features.append("extended thinking")
     print(f"{Fore.CYAN}Features: {', '.join(features)}")

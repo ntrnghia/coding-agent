@@ -1,4 +1,4 @@
-"""NTN - Minimal AI coding agent powered by Claude"""
+"""NTN - Minimal AI coding agent"""
 
 try:
     from ._version import __version__

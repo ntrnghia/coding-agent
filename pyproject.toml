@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "ntn"
 dynamic = ["version"]
-description = "Minimal AI coding agent powered by Claude"
+description = "Minimal AI coding agent"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "NTN", email = "ntn@example.com" }
 ]
-keywords = ["ai", "agent", "claude", "coding", "assistant", "anthropic"]
+keywords = ["ai", "agent", "coding", "assistant", "openai", "anthropic", "gpt", "claude"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -28,11 +28,14 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.75.0",
+    "openai>=1.12.0",
+    "tiktoken>=0.5.0",
     "colorama>=0.4.6",
     "prompt-toolkit>=3.0.0",
     "requests>=2.31.0",
     "beautifulsoup4>=4.12.0",
     "ddgs>=6.0.0",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +61,7 @@ include = [
     "/src",
     "/README.md",
     "/LICENSE",
+    "src/ntn/config.yaml",
 ]
 
 [tool.hatch.version]

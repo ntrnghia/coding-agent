@@ -4,6 +4,7 @@ import re
 from ddgs import DDGS
 import requests
 from bs4 import BeautifulSoup
+from .config import config
 
 
 def get_tool_description(tool_name, tool_input):
@@ -79,7 +80,14 @@ def _parse_exec_command(cmd):
                     suffix = f" ({direction} {num.lstrip('-')} lines)" if num else ""
                     return f"📄 Read {filename}{suffix}"
             return "📄 Read file"
-    
+
+    # sed -n line range commands: sed -n '1,200p' /path/to/file
+    if main_cmd.startswith("sed "):
+        if match := re.match(r"sed\s+-n\s+['\"]?(\d+),(\d+)p['\"]?\s+(.+)", main_cmd):
+            start, end, filepath = match.groups()
+            filename = filepath.strip().split('/')[-1]
+            return f"📄 Read {filename} (lines {start}-{end})"
+
     display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
     return f"⚡ Run: {display_cmd}"
 
@@ -87,27 +95,8 @@ def _parse_exec_command(cmd):
 class TerminalTool:
     """Execute shell commands in workspace"""
 
-    # Dangerous commands that require user confirmation
-    DANGEROUS_COMMANDS = {
-        # System destructive
-        'rm', 'rmdir', 'del', 'format', 'fdisk', 'mkfs',
-        # System modification
-        'shutdown', 'reboot', 'halt', 'poweroff', 'init',
-        # Permission/ownership
-        'chmod', 'chown', 'chgrp', 'sudo', 'su', 'runas',
-        # Network dangerous
-        'curl', 'wget', 'nc', 'netcat', 'ssh', 'scp', 'ftp', 'telnet',
-        # Process control
-        'kill', 'killall', 'pkill',
-        # Disk operations
-        'dd', 'mount', 'umount',
-        # Registry/system config (Windows)
-        'reg', 'regedit', 'bcdedit',
-        # Package managers that install system-wide
-        'apt', 'apt-get', 'yum', 'dnf', 'pacman', 'brew', 'choco',
-        # Dangerous shell operations
-        'eval', 'exec', 'source',
-    }
+    # Dangerous commands that require user confirmation (from config)
+    DANGEROUS_COMMANDS = config.tools.dangerous_commands
 
     def __init__(self, workspace_dir, confirm_callback=None):
         self.workspace_dir = workspace_dir
@@ -189,12 +178,12 @@ class WebSearchTool:
         }
 
     def execute(self, query):
-        """Search with fixed max_results=10"""
+        """Search with configurable max_results"""
         try:
             results = list(self.ddgs.text(
                 query,
-                region='wt-wt',
-                max_results=10
+                region=config.tools.web_search.region,
+                max_results=config.tools.web_search.max_results
             ))
             return {"results": results}
         except Exception as e:
@@ -223,7 +212,7 @@ class FetchWebTool:
     def execute(self, url):
         """Fetch webpage content"""
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=config.tools.web_fetch.timeout)
             soup = BeautifulSoup(response.content, 'html.parser')
 
             # Remove script and style elements
@@ -236,8 +225,8 @@ class FetchWebTool:
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
             text = '\n'.join(chunk for chunk in chunks if chunk)
 
-            # Limit to first 5000 chars
-            return {"content": text[:5000]}
+            # Limit content length from config
+            return {"content": text[:config.tools.web_fetch.content_limit]}
         except Exception as e:
             return {"error": str(e)}
 

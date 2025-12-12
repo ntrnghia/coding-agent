@@ -3,10 +3,7 @@
 Test script to verify prompt caching token requirements.
 
 This script verifies that the system prompt + tools meet the minimum
-token requirements for prompt caching on different Claude models:
-- Opus 4.5: 4096 tokens minimum
-- Sonnet 4.5: 1024 tokens minimum  
-- Haiku 4.5: 4096 tokens minimum
+token requirements for prompt caching on different models.
 
 Usage:
     python src/ntn/test_cache.py
@@ -18,19 +15,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import anthropic
+from ntn.config import config
 from ntn.tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool
 from ntn.prompts import get_system_prompt, get_mount_section_text
 
 
-# Model cache requirements (minimum tokens for caching to work)
-# - Opus 4.5: 4096 tokens
-# - Sonnet 4.5: 1024 tokens
-# - Haiku 4.5: 4096 tokens
-CACHE_REQUIREMENTS = {
-    "claude-opus-4-5": 4096,
-    "claude-sonnet-4-5": 1024,
-    "claude-haiku-4-5": 4096,
-}
+# Model cache requirements from centralized config
+CACHE_REQUIREMENTS = config.models.cache_requirements
 
 
 def get_test_system_prompt():
@@ -53,9 +44,8 @@ def get_tool_schemas():
     ]
     return [tool.get_schema() for tool in tools]
 
-# Overhead constant: count_tokens includes message framing (~323 tokens) + message itself
-# Using 'x' (1 token) as minimal message, total overhead is 324 tokens
-MESSAGE_OVERHEAD = 324
+# Overhead constant from centralized config
+MESSAGE_OVERHEAD = config.cache.message_overhead
 
 
 def count_tokens(client, model, system_text, tools=None):

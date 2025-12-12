@@ -1,9 +1,10 @@
-# NTN - Coding Agent with Claude Opus 4.5
+# NTN - Minimal AI Coding Agent
 
-A minimal AI agent that uses Claude API to help with coding tasks in a workspace.
+A minimal AI agent that helps with coding tasks in a workspace. Supports multiple LLM providers (OpenAI GPT-5.2, Anthropic Claude).
 
 ## Features
 
+- **Multi-provider support**: GPT-5.2 (default), Claude Opus/Sonnet/Haiku
 - **Docker-first file operations**: All file operations run in a Docker container with Unix tools
 - **Web search**: Search using DuckDuckGo (ddgs package)
 - **Web fetching**: Fetch and read webpage content
@@ -17,8 +18,8 @@ A minimal AI agent that uses Claude API to help with coding tasks in a workspace
 - **Auto-compact**: Automatically summarizes context when approaching token limit
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
-- **Prompt caching**: System prompt and tools are cached to reduce rate limit usage
-- **Model selection**: Choose between Opus, Sonnet, or Haiku models with `-m` flag
+- **Prompt caching**: System prompt and tools are cached to reduce costs
+- **Model selection**: Choose between GPT and Claude models with `-m` flag
 - **Streaming output**: Real-time response display (always enabled)
 - **Cost tracking**: Shows per-request and session costs with token usage
 - **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
@@ -39,14 +40,16 @@ pip install -e .
 
 ## Setup
 
-Set your Anthropic API key:
+Set your API key based on the model you want to use:
+
+**For GPT-5.2 (default):**
 ```bash
-export ANTHROPIC_API_KEY='your-api-key-here'
+export OPENAI_API_KEY='your-api-key-here'
 ```
 
-Or create a `.env` file:
+**For Claude models:**
 ```bash
-echo "ANTHROPIC_API_KEY=your-api-key-here" > .env
+export ANTHROPIC_API_KEY='your-api-key-here'
 ```
 
 (Optional) Install Docker for sandbox functionality.
@@ -74,15 +77,16 @@ ntn -t
 
 Use a different model:
 ```bash
-ntn -m sonnet  # Use Claude Sonnet 4.5 (faster, cheaper)
-ntn -m haiku   # Use Claude Haiku 4.5 (fastest, cheapest)
-ntn -m opus    # Use Claude Opus 4.5 (default, most capable)
+ntn -m gpt     # Use GPT-5.2 (default)
+ntn -m opus    # Use Claude Opus 4.5
+ntn -m sonnet  # Use Claude Sonnet 4.5
+ntn -m haiku   # Use Claude Haiku 4.5
 ```
 
 Combine flags:
 ```bash
 ntn -t -r           # Resume with extended thinking
-ntn -m sonnet -t    # Sonnet with extended thinking
+ntn -m opus -t      # Opus with extended thinking
 ```
 
 Alternative: Run as Python module:
@@ -111,6 +115,9 @@ ntn/
 │   ├── __main__.py    # Entry for `python -m ntn`
 │   ├── agent.py       # Main agent with auto-compact and resume support
 │   ├── tools.py       # Tool implementations (Terminal, Web, Docker)
+│   ├── providers.py   # LLM provider abstraction (OpenAI, Anthropic)
+│   ├── config.py      # Configuration loader
+│   ├── config.yaml    # Configuration values
 │   └── cli.py         # CLI entry point
 ├── pyproject.toml     # Package configuration
 ├── LICENSE            # MIT License
@@ -141,7 +148,7 @@ All file operations run in a Docker container for consistent Unix environment:
 
 ## Context Management
 
-The agent uses Claude Opus 4.5 with a 200K token context window. When the context approaches the limit:
+The agent automatically manages context when approaching token limits:
 
 1. **Auto-compact triggers**: Summarizes older conversation turns
 2. **Preserves current task**: Summary includes your current question
@@ -163,7 +170,7 @@ Sessions are logged incrementally to `debug/debug_<timestamp>.txt`. To resume:
 # Resume most recent session
 ntn -r
 
-# Resume specific session  
+# Resume specific session
 ntn -r debug/debug_20251210_120000.txt
 ```
 
@@ -173,6 +180,7 @@ On resume:
 - Container state is restored (mounts preserved)
 - New messages append to the same debug file
 - **Crash recovery**: If the agent crashed mid-turn, it will automatically continue from where it left off
+- **Multi-model support**: Can resume with a different model than originally used
 
 ## Debug Log Format
 
@@ -183,6 +191,7 @@ Debug files use an incremental format for crash resilience:
 <user message>
 --- ASSISTANT ---
 <JSON response>
+--- USAGE: {"model": "gpt", "input": 1000, "output": 50, ...} ---
 --- TOOL_RESULT ---
 <JSON tool results>
 --- END_TURN ---
@@ -195,7 +204,8 @@ Each block is written immediately, so even if the agent crashes, the debug file 
 The agent uses colored output for readability:
 - 🟢 **Green**: Agent messages
 - 🟡 **Yellow**: Tool operations (📂 List files, 📄 Read file, ✏️ Edit file, 🐳 Docker, etc.)
-- 🔵 **Cyan**: User prompts
+- 🟣 **Magenta**: Thinking indicator (when extended thinking enabled)
+- 🔵 **Cyan**: System messages, user prompts
 - 🔴 **Red**: Errors
 
 Full JSON input/output is logged to `debug/debug_<timestamp>.txt` for debugging.

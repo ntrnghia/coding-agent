@@ -11,3 +11,4 @@ dist/
 build/
 src/ntn/_version.py
 debug/
+.claude
