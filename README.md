@@ -217,3 +217,46 @@ Full JSON input/output is logged to `debug/debug_<timestamp>.txt` for debugging.
 - Docker sandbox provides isolated environment for external directories
 - All commands run in the specified workspace directory
 - Never commit API keys to version control
+
+## Multi-line input (Shift+Enter)
+
+This CLI uses `prompt-toolkit`.
+
+**Important:** Many terminals (including **VS Code integrated terminal** and **Windows Terminal**) do not pass a distinct `Shift+Enter` key event to terminal applications. To make `Shift+Enter` insert a newline reliably, configure your terminal to translate `Shift+Enter` into the sequence **Esc** then **Enter** (`\u001b\r`).
+
+The CLI binds:
+- `Enter`  submit
+- `Esc` then `Enter`  insert newline
+
+### VS Code (Windows / PowerShell)
+
+Add this to your VS Code `keybindings.json`:
+
+```json
+{
+  "key": "shift+enter",
+  "command": "workbench.action.terminal.sendSequence",
+  "args": {
+    "text": "\u001b\r"
+  },
+  "when": "terminalFocus"
+}
+```
+
+### Windows Terminal (Windows / PowerShell)
+
+In Windows Terminal `settings.json`, add an action that sends `Esc`+`Enter` and bind it to `shift+enter`.
+
+Example (schema varies slightly by Windows Terminal version):
+
+```json
+{
+  "keys": "shift+enter",
+  "command": {
+    "action": "sendInput",
+    "input": "\u001b\r"
+  }
+}
+```
+
+If you already created a `sendInput` action with an `id`, you can bind `shift+enter` to that action instead.

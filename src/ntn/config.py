@@ -116,12 +116,6 @@ class AgentConfig:
     max_retries: int
 
 
-@dataclass(frozen=True)
-class CLIConfig:
-    """CLI behavior configuration."""
-
-    shift_enter_threshold: float
-
 
 @dataclass(frozen=True)
 class WebSearchConfig:
@@ -163,7 +157,6 @@ class Config:
     docker: DockerConfig
     ui: UIConfig
     agent: AgentConfig
-    cli: CLIConfig
     tools: ToolsConfig
     cache: CacheConfig
 
@@ -225,7 +218,6 @@ def _load_config() -> Config:
         docker=DockerConfig(**data["docker"]),
         ui=ui,
         agent=AgentConfig(**data["agent"]),
-        cli=CLIConfig(**data["cli"]),
         tools=tools,
         cache=CacheConfig(**data["cache"]),
     )

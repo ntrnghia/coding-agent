@@ -7,6 +7,26 @@ from bs4 import BeautifulSoup
 from .config import config
 
 
+
+def _split_cd_prefix(cmd: str) -> tuple[str | None, str]:
+    """Extract (cwd, remainder) from `cd <cwd> && <remainder>` (or `;`).
+
+    Supports multiline remainder.
+    """
+    cmd = cmd.strip()
+    m = re.match(r"^cd\s+([^\n]+?)\s*(?:&&|;)\s*(.+)$", cmd, flags=re.S)
+    if not m:
+        return None, cmd
+    cwd = m.group(1).strip().strip('"').strip("'")
+    remainder = m.group(2).strip()
+    return cwd, remainder
+
+
+def _with_in_suffix(desc: str, cwd: str | None) -> str:
+    """Append the (In <cwd>) block when cwd is known."""
+    return f"{desc} (In {cwd})" if cwd else desc
+
+
 def get_tool_description(tool_name, tool_input):
     """Convert tool call to human-readable description for display"""
     if tool_name == "docker_sandbox":
@@ -16,7 +36,8 @@ def get_tool_description(tool_name, tool_input):
             return f"🐳 Mount directory: {path}"
         elif action == "exec":
             cmd = tool_input.get("command", "")
-            return _parse_exec_command(cmd)
+            cwd, remainder = _split_cd_prefix(cmd)
+            return _with_in_suffix(_parse_exec_command(remainder), cwd)
         elif action == "stop":
             path = tool_input.get("mount_path", "")
             if path:
@@ -26,8 +47,15 @@ def get_tool_description(tool_name, tool_input):
     
     elif tool_name == "execute_command":
         cmd = tool_input.get("command", "")
-        display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
-        return f"⚡ Run: {display_cmd}"
+        cwd, remainder = _split_cd_prefix(cmd)
+
+        # Improve readability for multiline heredoc snippets (common in debugging).
+        # Example: python - <<'PY' ...
+        if re.search(r"^python\s+.*<<\s*['\"]?\w+['\"]?", remainder, flags=re.S):
+            return _with_in_suffix("🐍 Run inline Python", cwd)
+
+        display_cmd = remainder[:60] + "..." if len(remainder) > 60 else remainder
+        return _with_in_suffix(f"⚡ Run: {display_cmd}", cwd)
     
     elif tool_name == "web_search":
         query = tool_input.get("query", "")
@@ -45,6 +73,10 @@ def _parse_exec_command(cmd):
     """Parse exec command into human-readable description"""
     parts = [p.strip() for p in cmd.split('|')]
     main_cmd = parts[0]
+
+    # Multiline heredoc snippets (common in debugging)
+    if re.search(r"^python(3)?\s+.*<<\s*['\"]?\w+['\"]?", main_cmd, flags=re.S):
+        return "🐍 Run inline Python"
     
     # Check for line limiting in pipe
     line_info = ""
@@ -66,7 +98,7 @@ def _parse_exec_command(cmd):
         if ">>" in main_cmd or main_cmd.startswith("cat >"):
             match = re.search(r'cat\s*>>?\s*([^\s<]+)', main_cmd)
             filename = match.group(1).split('/')[-1] if match else "file"
-            return f"✏️ {'Append to' if '>>' in main_cmd else 'Edit'} {filename}"
+            return f"✏️  {'Append to' if '>>' in main_cmd else 'Edit'} {filename}"
         elif ">" not in main_cmd and (match := re.search(r'cat\s+([^|]+)', main_cmd)):
             return f"📄 Read {match.group(1).strip().split('/')[-1]}{line_info}"
     

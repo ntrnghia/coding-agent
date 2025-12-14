@@ -20,39 +20,31 @@ init(autoreset=True)
 
 
 def create_key_bindings():
-    """Create key bindings: Enter=submit, Shift+Enter=newline (shows \\)"""
+    """Create key bindings.
+
+    Notes:
+        Most terminals (including VS Code integrated terminal and Windows Terminal
+        on Windows/PowerShell) do not send a distinct key event for Shift+Enter.
+
+        To support Shift+Enter for newline, we bind "Esc, Enter" to insert a
+        newline and recommend configuring the terminal to translate Shift+Enter
+        into the escape sequence: ESC + CR ("\u001b\r").
+
+        See README for suggested keybinding snippets.
+    """
     bindings = KeyBindings()
-    
-    # Track backslash timing for Shift+Enter detection
-    state = {'last_backslash_time': 0}
-    SHIFT_ENTER_THRESHOLD = config.cli.shift_enter_threshold
 
     @bindings.add('enter')
     def handle_enter(event):
-        """Submit on Enter, or newline if it immediately follows backslash (Shift+Enter)"""
-        time_since_backslash = time.time() - state['last_backslash_time']
-        if time_since_backslash < SHIFT_ENTER_THRESHOLD:
-            # This Enter is part of Shift+Enter sequence - insert newline
-            # The backslash was already inserted, so just add the newline
-            event.current_buffer.insert_text('\n')
-        else:
-            # Regular Enter - submit
-            event.current_buffer.validate_and_handle()
-
-    @bindings.add('\\')
-    def handle_backslash(event):
-        """Insert backslash and record time (for Shift+Enter detection)"""
-        state['last_backslash_time'] = time.time()
-        event.current_buffer.insert_text('\\')
+        """Submit on Enter."""
+        event.current_buffer.validate_and_handle()
 
     @bindings.add('escape', 'enter')
-    def handle_alt_enter(event):
-        """Insert newline on Alt+Enter (fallback)"""
-        event.current_buffer.insert_text('\n')
+    def handle_escape_enter(event):
+        """Insert newline on Esc+Enter.
 
-    @bindings.add('c-j')
-    def handle_ctrl_j(event):
-        """Insert newline on Ctrl+J (fallback)"""
+        Terminals can be configured to translate Shift+Enter into this sequence.
+        """
         event.current_buffer.insert_text('\n')
 
     return bindings

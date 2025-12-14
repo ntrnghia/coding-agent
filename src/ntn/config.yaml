@@ -104,11 +104,6 @@ agent:
   max_turns: 100
   max_retries: 3
 
-# CLI settings
-cli:
-  # Time threshold for Shift+Enter detection (seconds)
-  shift_enter_threshold: 0.05
-
 # Tool settings
 tools:
   # Dangerous commands requiring user confirmation
