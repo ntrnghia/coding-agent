@@ -91,6 +91,7 @@ class ColorsConfig:
     assistant: str
     thinking: str
     tool: str
+    tool_path: str
     error: str
     warning: str
     system: str
@@ -104,6 +105,7 @@ class UIConfig:
     divider_width: int
     show_compact_content: bool
     show_drop_indicator: bool
+    show_think_content: bool
     prefixes: PrefixesConfig
     colors: ColorsConfig
 
@@ -209,6 +211,7 @@ def _load_config() -> Config:
         divider_width=data["ui"]["divider_width"],
         show_compact_content=data["ui"]["show_compact_content"],
         show_drop_indicator=data["ui"]["show_drop_indicator"],
+        show_think_content=data["ui"].get("show_think_content", False),
         prefixes=PrefixesConfig(**data["ui"]["prefixes"]),
         colors=ColorsConfig(**data["ui"]["colors"]),
     )

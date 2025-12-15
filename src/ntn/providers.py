@@ -1,89 +1,12 @@
-"""
-Provider abstraction layer for LLM APIs.
+"""Provider abstraction layer for LLM APIs."""
 
-This module provides a unified interface for Anthropic and OpenAI APIs,
-handling the differences in message formats, streaming, and tool schemas.
-"""
+from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional
 import json
 import os
+from typing import Any, Dict, Generator, List, Optional
 
-
-@dataclass
-class Usage:
-    """Unified token usage across providers."""
-
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
-
-
-@dataclass
-class StreamEvent:
-    """Unified streaming event."""
-
-    type: str  # "thinking_start", "thinking_delta", "signature_delta", "text_start",
-    # "text_delta", "tool_use_start", "tool_input_delta", "content_block_stop"
-    data: Any = None
-
-
-@dataclass
-class APIResponse:
-    """Unified API response."""
-
-    content: List[Dict]  # Normalized content blocks
-    stop_reason: str  # "end_turn", "tool_use", "max_tokens"
-    usage: Usage
-    raw_response: Any  # Original response for rate limit headers
-
-
-class BaseProvider(ABC):
-    """Base class for LLM providers."""
-
-    @abstractmethod
-    def create(
-        self,
-        messages: List[Dict],
-        system: str,
-        tools: List[Dict],
-        max_tokens: int,
-        thinking_config: Optional[Dict] = None,
-    ) -> APIResponse:
-        """Make a non-streaming API call."""
-        pass
-
-    @abstractmethod
-    def stream(
-        self,
-        messages: List[Dict],
-        system: str,
-        tools: List[Dict],
-        max_tokens: int,
-        thinking_config: Optional[Dict] = None,
-    ) -> Generator[StreamEvent, None, APIResponse]:
-        """Make a streaming API call. Yields events, returns final response."""
-        pass
-
-    @abstractmethod
-    def count_tokens(
-        self, messages: List[Dict], system: str, tools: List[Dict]
-    ) -> int:
-        """Count tokens for the given messages."""
-        pass
-
-    @abstractmethod
-    def convert_tools(self, tools: List[Dict]) -> List[Dict]:
-        """Convert tool schemas to provider-specific format."""
-        pass
-
-    @abstractmethod
-    def get_rate_limit_info(self, response: Any) -> Dict:
-        """Extract rate limit info from response headers."""
-        pass
+from .provider_types import APIResponse, BaseProvider, StreamEvent, Usage
 
 
 class AnthropicProvider(BaseProvider):
@@ -264,7 +187,14 @@ class AnthropicProvider(BaseProvider):
 
 
 class OpenAIProvider(BaseProvider):
-    """OpenAI GPT API provider."""
+    """OpenAI GPT API provider using Responses API.
+
+    This enables:
+    - reasoning token accounting via usage.output_tokens_details.reasoning_tokens
+    - optional reasoning summaries ("thinking content") when requested
+    - tool calling via output items of type "function_call"
+    - streaming deltas for both assistant text and reasoning summaries
+    """
 
     def __init__(self, model: str):
         import openai
@@ -272,7 +202,6 @@ class OpenAIProvider(BaseProvider):
 
         self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = model
-        # Use cl100k_base encoding for GPT-4 and later models
         self.encoding = tiktoken.get_encoding("cl100k_base")
 
     def create(
@@ -283,10 +212,18 @@ class OpenAIProvider(BaseProvider):
         max_tokens: int,
         thinking_config: Optional[Dict] = None,
     ) -> APIResponse:
-        """Make non-streaming OpenAI API call."""
-        kwargs = self._build_kwargs(messages, system, tools, max_tokens, thinking_config)
-        response = self.client.chat.completions.create(**kwargs)
-        return self._normalize_response(response)
+        """Make non-streaming OpenAI API call using Responses API."""
+        reasoning = self._build_reasoning(thinking_config)
+        resp = self.client.responses.create(
+            model=self.model,
+            instructions=system,
+            input=self._convert_messages(messages),
+            tools=self.convert_tools(tools),
+            tool_choice="auto" if tools else "none",
+            reasoning=reasoning,
+            max_output_tokens=max_tokens,
+        )
+        return self._normalize_response(resp)
 
     def stream(
         self,
@@ -296,362 +233,136 @@ class OpenAIProvider(BaseProvider):
         max_tokens: int,
         thinking_config: Optional[Dict] = None,
     ) -> Generator[StreamEvent, None, APIResponse]:
-        """Stream OpenAI API response."""
-        kwargs = self._build_kwargs(messages, system, tools, max_tokens, thinking_config)
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
+        """Stream OpenAI API response using Responses API."""
+        reasoning = self._build_reasoning(thinking_config)
+        stream = self.client.responses.create(
+            model=self.model,
+            instructions=system,
+            input=self._convert_messages(messages),
+            tools=self.convert_tools(tools),
+            tool_choice="auto" if tools else "none",
+            reasoning=reasoning,
+            max_output_tokens=max_tokens,
+            stream=True,
+        )
 
-        current_tool_call = None
-        final_usage = None
-        http_response = None
+        import openai.types.responses as r
+
         text_started = False
-        finish_reason = None
+        thinking_started = False
+        final_response = None
 
-        response_stream = self.client.chat.completions.create(**kwargs)
-
-        # Capture HTTP response for headers (rate limits)
-        if hasattr(response_stream, "response"):
-            http_response = response_stream.response
-
-        for chunk in response_stream:
-
-            # Handle usage in final chunk
-            if hasattr(chunk, "usage") and chunk.usage:
-                final_usage = chunk.usage
-
-            if not chunk.choices:
+        for ev in stream:
+            if isinstance(ev, r.ResponseCompletedEvent):
+                final_response = ev.response
                 continue
 
-            delta = chunk.choices[0].delta
+            # Reasoning summary stream -> thinking
+            if isinstance(ev, r.ResponseReasoningSummaryPartAddedEvent):
+                if not thinking_started:
+                    thinking_started = True
+                    yield StreamEvent("thinking_start")
+                continue
 
-            # Handle text content
-            if delta.content:
+            if isinstance(ev, r.ResponseReasoningSummaryTextDeltaEvent):
+                if not thinking_started:
+                    thinking_started = True
+                    yield StreamEvent("thinking_start")
+                yield StreamEvent("thinking_delta", ev.delta)
+                continue
+
+            if isinstance(ev, r.ResponseReasoningSummaryTextDoneEvent):
+                if thinking_started:
+                    thinking_started = False
+                    yield StreamEvent("content_block_stop")
+                continue
+
+            # Visible assistant text
+            if isinstance(ev, r.ResponseTextDeltaEvent):
                 if not text_started:
-                    yield StreamEvent("text_start")
                     text_started = True
-                yield StreamEvent("text_delta", delta.content)
+                    yield StreamEvent("text_start")
+                yield StreamEvent("text_delta", ev.delta)
+                continue
 
-            # Handle tool calls
-            if delta.tool_calls:
-                for tool_call_delta in delta.tool_calls:
-                    if tool_call_delta.id:  # New tool call starting
-                        if current_tool_call:
-                            yield StreamEvent("content_block_stop")
-                        current_tool_call = {
-                            "id": tool_call_delta.id,
-                            "name": tool_call_delta.function.name
-                            if tool_call_delta.function
-                            else "",
-                        }
-                        yield StreamEvent("tool_use_start", current_tool_call)
-
-                    if tool_call_delta.function and tool_call_delta.function.arguments:
-                        yield StreamEvent(
-                            "tool_input_delta", tool_call_delta.function.arguments
-                        )
-
-            # Check for finish reason
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+            if isinstance(ev, r.ResponseTextDoneEvent):
                 if text_started:
-                    yield StreamEvent("content_block_stop")
                     text_started = False
-                if current_tool_call:
                     yield StreamEvent("content_block_stop")
-                    current_tool_call = None
+                continue
 
-        # Build final response
-        # OpenAI: prompt_tokens INCLUDES cached tokens, so subtract to get non-cached
-        cached_tokens = (
-            getattr(
-                getattr(final_usage, "prompt_tokens_details", None), "cached_tokens", 0
-            )
-            if final_usage
-            else 0
-        ) or 0
-        prompt_tokens = final_usage.prompt_tokens if final_usage else 0
-        usage = Usage(
-            input_tokens=prompt_tokens - cached_tokens,  # Non-cached input only
-            output_tokens=final_usage.completion_tokens if final_usage else 0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=cached_tokens,
-        )
+            # Tool calling
+            if isinstance(ev, r.ResponseOutputItemAddedEvent):
+                item = ev.item
+                if getattr(item, "type", None) == "function_call":
+                    yield StreamEvent("tool_use_start", {"id": item.call_id, "name": item.name})
+                continue
 
-        # Map OpenAI finish_reason to unified stop_reason
-        stop_reason_map = {
-            "stop": "end_turn",
-            "tool_calls": "tool_use",
-            "length": "max_tokens",
-        }
-        stop_reason = stop_reason_map.get(finish_reason, finish_reason or "end_turn")
+            if isinstance(ev, r.ResponseFunctionCallArgumentsDeltaEvent):
+                yield StreamEvent("tool_input_delta", ev.delta)
+                continue
 
-        return APIResponse(
-            content=[],  # Content built by streaming handler
-            stop_reason=stop_reason,
-            usage=usage,
-            raw_response=http_response,  # HTTP response for rate limit headers
-        )
+            if isinstance(ev, r.ResponseFunctionCallArgumentsDoneEvent):
+                yield StreamEvent("content_block_stop")
+                continue
 
-    def count_tokens(
-        self, messages: List[Dict], system: str, tools: List[Dict]
-    ) -> int:
-        """Count tokens using OpenAI's official formula.
+        # Close any open block
+        if thinking_started or text_started:
+            yield StreamEvent("content_block_stop")
 
-        Based on: https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken
-        """
+        if final_response is None:
+            usage = Usage(0, 0, 0, 0, 0)
+            return APIResponse(content=[], stop_reason="end_turn", usage=usage, raw_response=getattr(stream, "response", None))
+
+        return self._normalize_response(final_response)
+
+    def count_tokens(self, messages: List[Dict], system: str, tools: List[Dict]) -> int:
+        """Approximate token count using chat-style formula."""
         num_tokens = 0
-
-        # System message (counts as a message with role + content)
-        num_tokens += 3  # tokens_per_message for system
+        num_tokens += 3
         num_tokens += len(self.encoding.encode(system))
-
-        # Count messages using official formula
         for message in messages:
-            num_tokens += 3  # tokens_per_message
+            num_tokens += 3
             for key, value in message.items():
                 if isinstance(value, str):
                     num_tokens += len(self.encoding.encode(value))
                 elif isinstance(value, list):
-                    # Tool results/content blocks - encode each item's text content
                     for item in value:
                         if isinstance(item, dict):
-                            # Extract text content, not JSON
                             if "text" in item:
                                 num_tokens += len(self.encoding.encode(item["text"]))
                             elif "content" in item:
                                 num_tokens += len(self.encoding.encode(str(item["content"])))
                             else:
-                                # Fallback for other dict types (tool_use, thinking, etc.)
                                 num_tokens += len(self.encoding.encode(json.dumps(item)))
                 if key == "name":
                     num_tokens += 1
-
-        num_tokens += 3  # Reply priming
-
-        # Count tools using model-specific overhead
-        if tools:
-            num_tokens += self._count_tool_tokens(tools)
-
+        num_tokens += 3
         return num_tokens
 
-    def _count_tool_tokens(self, tools: List[Dict]) -> int:
-        """Count tokens for tool definitions using OpenAI's format.
-
-        OpenAI converts tools to TypeScript internally. Uses model-specific overhead values.
-        Based on: https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken
-        """
-        # Use gpt-4o overhead values
-        func_init, prop_init, prop_key, func_end = 7, 3, 3, 12
-        enum_init, enum_item = -3, 3
-
-        token_count = 0
-        for tool in tools:
-            token_count += func_init
-            name = tool.get("name", "")
-            desc = tool.get("description", "").rstrip(".")
-            token_count += len(self.encoding.encode(f"{name}:{desc}"))
-
-            params = tool.get("input_schema", {}).get("properties", {})
-            if params:
-                token_count += prop_init
-                for key, prop in params.items():
-                    token_count += prop_key
-                    p_type = prop.get("type", "")
-                    p_desc = prop.get("description", "").rstrip(".")
-                    token_count += len(self.encoding.encode(f"{key}:{p_type}:{p_desc}"))
-
-                    if "enum" in prop:
-                        token_count += enum_init
-                        for item in prop["enum"]:
-                            token_count += enum_item
-                            token_count += len(self.encoding.encode(item))
-
-            token_count += func_end
-
-        return token_count
-
     def convert_tools(self, tools: List[Dict]) -> List[Dict]:
-        """Convert Anthropic tool format to OpenAI function format."""
-        openai_tools = []
+        """Convert Anthropic tool format to Responses API function format."""
+        converted = []
         for tool in tools:
-            openai_tool = {
-                "type": "function",
-                "function": {
+            converted.append(
+                {
+                    "type": "function",
                     "name": tool["name"],
                     "description": tool.get("description", ""),
                     "parameters": tool.get("input_schema", {}),
-                },
-            }
-            openai_tools.append(openai_tool)
-        return openai_tools
-
-    def _build_kwargs(
-        self,
-        messages: List[Dict],
-        system: str,
-        tools: List[Dict],
-        max_tokens: int,
-        thinking_config: Optional[Dict],
-    ) -> Dict:
-        """Build OpenAI API kwargs."""
-        # Convert messages format and prepend system message
-        openai_messages = [{"role": "system", "content": system}]
-        openai_messages.extend(self._convert_messages(messages))
-
-        kwargs = {
-            "model": self.model,
-            "max_completion_tokens": max_tokens,
-            "messages": openai_messages,
-        }
-
-        converted_tools = self.convert_tools(tools)
-        if converted_tools:
-            kwargs["tools"] = converted_tools
-
-        # gpt-5.2 has built-in reasoning, use reasoning_effort for control
-        if thinking_config:
-            budget = thinking_config.get("budget_tokens", 0)
-            if budget > 50000:
-                kwargs["reasoning_effort"] = "high"
-            elif budget > 20000:
-                kwargs["reasoning_effort"] = "medium"
-            else:
-                kwargs["reasoning_effort"] = "low"
-
-        return kwargs
-
-    def _convert_messages(self, messages: List[Dict]) -> List[Dict]:
-        """Convert messages from Anthropic to OpenAI format."""
-        openai_messages = []
-
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-
-            if role == "user":
-                if isinstance(content, str):
-                    openai_messages.append({"role": "user", "content": content})
-                elif isinstance(content, list):
-                    # Check if tool_result
-                    if content and content[0].get("type") == "tool_result":
-                        for item in content:
-                            openai_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": item.get("tool_use_id"),
-                                    "content": str(item.get("content", "")),
-                                }
-                            )
-                    else:
-                        # Other structured content - stringify
-                        text_parts = []
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text_parts.append(item.get("text", ""))
-                            else:
-                                text_parts.append(json.dumps(item))
-                        openai_messages.append(
-                            {"role": "user", "content": "\n".join(text_parts)}
-                        )
-
-            elif role == "assistant":
-                if isinstance(content, str):
-                    openai_messages.append({"role": "assistant", "content": content})
-                elif isinstance(content, list):
-                    # Extract text and tool_use from content blocks
-                    text_parts = []
-                    tool_calls = []
-
-                    for block in content:
-                        if block.get("type") == "text":
-                            text_parts.append(block.get("text", ""))
-                        elif block.get("type") == "tool_use":
-                            tool_calls.append(
-                                {
-                                    "id": block.get("id"),
-                                    "type": "function",
-                                    "function": {
-                                        "name": block.get("name"),
-                                        "arguments": json.dumps(block.get("input", {})),
-                                    },
-                                }
-                            )
-                        # Skip thinking blocks - OpenAI doesn't need them
-
-                    assistant_msg = {"role": "assistant"}
-                    if text_parts:
-                        assistant_msg["content"] = "\n".join(text_parts)
-                    if tool_calls:
-                        assistant_msg["tool_calls"] = tool_calls
-
-                    if text_parts or tool_calls:
-                        openai_messages.append(assistant_msg)
-
-        return openai_messages
-
-    def _normalize_response(self, response) -> APIResponse:
-        """Convert OpenAI response to unified format."""
-        content = []
-        choice = response.choices[0]
-        message = choice.message
-
-        # Add text content
-        if message.content:
-            content.append({"type": "text", "text": message.content})
-
-        # Add tool calls
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                content.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "input": json.loads(tc.function.arguments)
-                        if tc.function.arguments
-                        else {},
-                    }
-                )
-
-        # Normalize stop reason
-        stop_reason_map = {
-            "stop": "end_turn",
-            "tool_calls": "tool_use",
-            "length": "max_tokens",
-        }
-        stop_reason = stop_reason_map.get(choice.finish_reason, choice.finish_reason)
-
-        # Handle usage
-        # OpenAI: prompt_tokens INCLUDES cached tokens, so subtract to get non-cached
-        cached_tokens = (
-            getattr(
-                getattr(response.usage, "prompt_tokens_details", None), "cached_tokens", 0
+                }
             )
-            if response.usage
-            else 0
-        ) or 0
-        prompt_tokens = response.usage.prompt_tokens if response.usage else 0
-        usage = Usage(
-            input_tokens=prompt_tokens - cached_tokens,  # Non-cached input only
-            output_tokens=response.usage.completion_tokens if response.usage else 0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=cached_tokens,
-        )
-
-        return APIResponse(
-            content=content,
-            stop_reason=stop_reason,
-            usage=usage,
-            raw_response=response,
-        )
+        return converted
 
     def get_rate_limit_info(self, response: Any) -> Dict:
         """Extract OpenAI rate limit headers."""
         headers = {}
         if hasattr(response, "headers"):
             headers = response.headers
+        elif hasattr(response, "response") and getattr(response, "response") is not None:
+            headers = response.response.headers
 
-        def get_int(key):
+        def get_int(key: str):
             val = headers.get(key)
             return int(val) if val else None
 
@@ -663,6 +374,133 @@ class OpenAIProvider(BaseProvider):
             "output_limit": None,
             "output_remaining": None,
         }
+
+    def _build_reasoning(self, thinking_config: Optional[Dict]) -> Dict:
+        """Build reasoning configuration for Responses API."""
+        if not thinking_config:
+            return {"effort": "low"}
+
+        budget = thinking_config.get("budget_tokens", 0)
+        if budget > 50000:
+            effort = "high"
+        elif budget > 20000:
+            effort = "medium"
+        else:
+            effort = "low"
+
+        reasoning = {"effort": effort}
+        # Request summary for thinking content display
+        reasoning["summary"] = "auto"
+        return reasoning
+
+    def _convert_messages(self, messages: List[Dict]) -> List[Dict]:
+        """Convert messages from Anthropic to Responses API format."""
+        items = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "user":
+                if isinstance(content, str):
+                    items.append({"role": "user", "content": content})
+                elif isinstance(content, list) and content and content[0].get("type") == "tool_result":
+                    for tr in content:
+                        items.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": tr.get("tool_use_id"),
+                                "output": str(tr.get("content", "")),
+                            }
+                        )
+                else:
+                    items.append({"role": "user", "content": json.dumps(content)})
+
+            elif role == "assistant":
+                if isinstance(content, str):
+                    items.append({"role": "assistant", "content": content})
+                elif isinstance(content, list):
+                    for block in content:
+                        if block.get("type") == "tool_use":
+                            items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": block.get("id"),
+                                    "name": block.get("name"),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                }
+                            )
+                        elif block.get("type") == "text":
+                            items.append({"role": "assistant", "content": block.get("text", "")})
+                        # thinking blocks omitted
+
+        return items
+
+    def _normalize_response(self, response: Any) -> APIResponse:
+        """Convert Responses API response to unified format."""
+        content = []
+
+        # 1) thinking summary (if any)
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "reasoning":
+                summary_parts = getattr(item, "summary", None) or []
+                summary_texts = []
+                for part in summary_parts:
+                    if isinstance(part, dict):
+                        if part.get("type") == "summary_text":
+                            summary_texts.append(part.get("text", ""))
+                    else:
+                        if getattr(part, "type", None) == "summary_text":
+                            summary_texts.append(getattr(part, "text", ""))
+                if summary_texts:
+                    content.append(
+                        {
+                            "type": "thinking",
+                            "thinking": "\n".join(summary_texts),
+                            "signature": "openai_summary",
+                        }
+                    )
+
+        # 2) tool calls
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "function_call":
+                try:
+                    args = json.loads(getattr(item, "arguments", "") or "{}")
+                except Exception:
+                    args = {}
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": getattr(item, "call_id", ""),
+                        "name": getattr(item, "name", ""),
+                        "input": args,
+                    }
+                )
+
+        # 3) assistant text
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant":
+                for part in getattr(item, "content", []) or []:
+                    if getattr(part, "type", None) == "output_text":
+                        content.append({"type": "text", "text": getattr(part, "text", "")})
+
+        usage_obj = getattr(response, "usage", None)
+        cached_tokens = (
+            getattr(getattr(usage_obj, "input_tokens_details", None), "cached_tokens", 0) if usage_obj else 0
+        )
+        reasoning_tokens = (
+            getattr(getattr(usage_obj, "output_tokens_details", None), "reasoning_tokens", 0) if usage_obj else 0
+        )
+
+        usage = Usage(
+            input_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=cached_tokens or 0,
+            reasoning_tokens=reasoning_tokens or 0,
+        )
+
+        stop_reason = "tool_use" if any(b.get("type") == "tool_use" for b in content) else "end_turn"
+        return APIResponse(content=content, stop_reason=stop_reason, usage=usage, raw_response=response)
 
 
 def create_provider(model_id: str, provider_name: str) -> BaseProvider:

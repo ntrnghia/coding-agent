@@ -7,12 +7,15 @@ except ImportError:
 
 __author__ = "NTN"
 
-from .agent import CodingAgent, ContainerManager, print_divider
+# Public API re-exports
+from .agent import CodingAgent
+from .docker_manager import ContainerManager
+from .ui import print_divider
 from .tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool
 
 __all__ = [
     "CodingAgent",
-    "ContainerManager", 
+    "ContainerManager",
     "print_divider",
     "TerminalTool",
     "WebSearchTool",

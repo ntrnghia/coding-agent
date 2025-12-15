@@ -1,26 +1,15 @@
-# NTN Agent Configuration
-# This file contains all configurable values for the ntn coding agent.
-
-# Model configurations
 models:
-  # Short name to full model ID mapping
   aliases:
-    opus: "claude-opus-4-5"
-    sonnet: "claude-sonnet-4-5"
-    haiku: "claude-haiku-4-5"
-    gpt: "gpt-5.2"
-
-  # Provider for each model ID
+    opus: claude-opus-4-5
+    sonnet: claude-sonnet-4-5
+    haiku: claude-haiku-4-5
+    gpt: gpt-5.2
   providers:
-    claude-opus-4-5: "anthropic"
-    claude-sonnet-4-5: "anthropic"
-    claude-haiku-4-5: "anthropic"
-    gpt-5.2: "openai"
-
-  # Default model to use
-  default: "gpt"
-
-  # Per-model context and output limits
+    claude-opus-4-5: anthropic
+    claude-sonnet-4-5: anthropic
+    claude-haiku-4-5: anthropic
+    gpt-5.2: openai
+  default: opus
   limits:
     claude-opus-4-5:
       max_context_tokens: 200000
@@ -32,137 +21,113 @@ models:
       max_context_tokens: 200000
       max_output_tokens: 64000
     gpt-5.2:
-      max_context_tokens: 400000  # Actual OpenAI API limit
+      max_context_tokens: 400000
       max_output_tokens: 128000
-
-  # Per-model extended thinking budget
   thinking_budget:
     claude-opus-4-5: 63999
     claude-sonnet-4-5: 63999
     claude-haiku-4-5: 63999
     gpt-5.2: 127999
-
-  # Pricing per 1M tokens (USD)
   pricing:
     claude-opus-4-5:
       input: 5
       output: 25
       cache_write: 6.25
-      cache_read: 0.50
+      cache_read: 0.5
     claude-sonnet-4-5:
       input: 3
       output: 15
       cache_write: 3.75
-      cache_read: 0.30
+      cache_read: 0.3
     claude-haiku-4-5:
       input: 1
       output: 5
       cache_write: 1.25
-      cache_read: 0.10
+      cache_read: 0.1
     gpt-5.2:
       input: 1.75
-      output: 14.00
+      output: 14.0
       cache_write: 0
       cache_read: 0.175
-
-  # Minimum tokens for prompt caching
   cache_requirements:
     claude-opus-4-5: 4096
     claude-sonnet-4-5: 1024
     claude-haiku-4-5: 4096
     gpt-5.2: 1024
-
-# Docker/Container settings
 docker:
-  default_image: "python:slim"
-
-# UI settings
+  default_image: python:slim
 ui:
   divider_width: 80
-  show_compact_content: true  # Show compaction summary content
-  show_drop_indicator: true   # Show indicator when dropping turns due to context overflow
-
-  # Display prefixes
+  show_compact_content: true
+  show_drop_indicator: true
   prefixes:
-    user: "You:"
-    assistant: "Agent:"
-
-  # Colors for different elements (colorama color names)
-  # Options: BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, RESET
+    user: 'You:'
+    assistant: 'Agent:'
   colors:
-    user: "RESET"
-    assistant: "GREEN"
-    thinking: "MAGENTA"
-    tool: "YELLOW"
-    error: "RED"
-    warning: "YELLOW"
-    system: "CYAN"
-    success: "GREEN"
-
-# Agent settings
+    user: RESET
+    assistant: GREEN
+    thinking: MAGENTA
+    tool: YELLOW
+    tool_path: CYAN
+    error: RED
+    warning: YELLOW
+    system: CYAN
+    success: GREEN
+  show_think_content: true
 agent:
   max_turns: 100
   max_retries: 3
-
-# Tool settings
 tools:
-  # Dangerous commands requiring user confirmation
   dangerous_commands:
-    - rm
-    - rmdir
-    - del
-    - format
-    - fdisk
-    - mkfs
-    - shutdown
-    - reboot
-    - halt
-    - poweroff
-    - init
-    - chmod
-    - chown
-    - chgrp
-    - sudo
-    - su
-    - runas
-    - curl
-    - wget
-    - nc
-    - netcat
-    - ssh
-    - scp
-    - ftp
-    - telnet
-    - kill
-    - killall
-    - pkill
-    - dd
-    - mount
-    - umount
-    - reg
-    - regedit
-    - bcdedit
-    - apt
-    - apt-get
-    - yum
-    - dnf
-    - pacman
-    - brew
-    - choco
-    - eval
-    - exec
-    - source
-
-  # Web search settings
+  - rm
+  - rmdir
+  - del
+  - format
+  - fdisk
+  - mkfs
+  - shutdown
+  - reboot
+  - halt
+  - poweroff
+  - init
+  - chmod
+  - chown
+  - chgrp
+  - sudo
+  - su
+  - runas
+  - curl
+  - wget
+  - nc
+  - netcat
+  - ssh
+  - scp
+  - ftp
+  - telnet
+  - kill
+  - killall
+  - pkill
+  - dd
+  - mount
+  - umount
+  - reg
+  - regedit
+  - bcdedit
+  - apt
+  - apt-get
+  - yum
+  - dnf
+  - pacman
+  - brew
+  - choco
+  - eval
+  - exec
+  - source
   web_search:
     max_results: 10
-    region: "wt-wt"
-
-  # Web fetch settings
+    region: wt-wt
   web_fetch:
     timeout: 10
     content_limit: 5000
-
-# Cache testing (used by test_cache.py)
 cache:
   message_overhead: 324

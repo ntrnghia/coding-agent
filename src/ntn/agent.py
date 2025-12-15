@@ -1,224 +1,36 @@
+"""Core agent implementation.
+
+This file hosts the CodingAgent class extracted from agent.py.
+agent.py can remain as a thin compatibility layer/import.
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import re
-import subprocess
 import time
 from datetime import datetime
+
 from colorama import Fore, Style, init
+
 from .config import config, get_color
-from .providers import create_provider, Usage
-from .tools import get_tool_description
+from .docker_manager import ContainerManager
+from . import providers
 from .prompts import get_system_prompt, get_mount_section_text, get_no_mount_section_text
+from .session_log import SessionLogger
+from .tools import get_tool_description
+from .ui import print_divider, print_status_box
 
 # Initialize colorama
 init(autoreset=True)
 
-# UI constants
-DIVIDER_WIDTH = config.ui.divider_width
-DIVIDER_LINE = '─' * DIVIDER_WIDTH
-
-def print_divider():
-    """Print a horizontal divider line"""
-    print(f"{Style.DIM}{DIVIDER_LINE}{Style.RESET_ALL}")
-
-
-class ContainerManager:
-    """Manages a persistent Docker container for the agent session"""
-
-    DEFAULT_IMAGE = config.docker.default_image
-    
-    def __init__(self, container_name, working_dirs=None):
-        self.container_name = container_name
-        self.working_dirs = working_dirs or []
-        self.image = self.DEFAULT_IMAGE
-    
-    @staticmethod
-    def convert_path(win_path, lowercase=False):
-        """Convert Windows path to Unix-style path
-        D:\\Downloads\\coding_agent → /d/downloads/coding_agent
-        
-        Args:
-            win_path: Windows path to convert
-            lowercase: If True, lowercase entire path (for mount targets)
-        """
-        path = os.path.normpath(win_path).replace('\\', '/')
-        if len(path) > 1 and path[1] == ':':
-            path = '/' + path[0].lower() + path[2:]
-        return path.lower() if lowercase else path
-    
-    def is_path_covered(self, new_path):
-        """Check if a path is already covered by an existing mount"""
-        new_norm = os.path.normpath(new_path).lower()
-        for existing in self.working_dirs:
-            existing_norm = os.path.normpath(existing).lower()
-            if new_norm.startswith(existing_norm + os.sep) or new_norm == existing_norm:
-                return True
-        return False
-    
-    def add_working_dir(self, path):
-        """Add a working directory. Returns True if added (requires restart), False if already covered."""
-        norm_path = os.path.normpath(path)
-        if self.is_path_covered(norm_path):
-            return False
-        self.working_dirs.append(norm_path)
-        return True
-    
-    def _build_mount_args(self):
-        """Build Docker -v mount arguments for all working directories"""
-        args = []
-        for path in self.working_dirs:
-            docker_path = self.convert_path(path)
-            mount_path = self.convert_path(path, lowercase=True)
-            args.extend(["-v", f"{docker_path}:{mount_path}"])
-        return args
-    
-    def get_mount_info(self):
-        """Get mount information for system prompt"""
-        return "\n".join(
-            f"  - {path} → {self.convert_path(path, lowercase=True)}"
-            for path in self.working_dirs
-        )
-    
-    def container_exists(self):
-        """Check if container exists (running or stopped)"""
-        try:
-            result = subprocess.run(
-                ["docker", "inspect", self.container_name],
-                capture_output=True,
-                text=True
-            )
-            return result.returncode == 0
-        except:
-            return False
-    
-    def container_running(self):
-        """Check if container is currently running"""
-        try:
-            result = subprocess.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
-                capture_output=True,
-                text=True
-            )
-            return result.returncode == 0 and result.stdout.strip() == "true"
-        except:
-            return False
-    
-    def start(self):
-        """Start the container (create if doesn't exist, start if stopped)"""
-        if self.container_running():
-            return {"status": "already_running", "container": self.container_name}
-        
-        if self.container_exists():
-            # Container exists but stopped - start it
-            result = subprocess.run(
-                ["docker", "start", self.container_name],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                return {"status": "started", "container": self.container_name}
-            else:
-                # Container might be corrupted, remove and recreate
-                subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
-        
-        # Create new container
-        return self._create_container()
-    
-    def _create_container(self):
-        """Create a new container with all mounts"""
-        if not self.working_dirs:
-            return {"error": "No working directories to mount"}
-        
-        try:
-            # Pull image first
-            subprocess.run(["docker", "pull", self.image], capture_output=True, text=True)
-            
-            # Build command
-            cmd = ["docker", "run", "-d", "--name", self.container_name]
-            cmd.extend(self._build_mount_args())
-            cmd.extend([self.image, "tail", "-f", "/dev/null"])
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                return {"error": f"Failed to create container: {result.stderr}"}
-            
-            return {"status": "created", "container": self.container_name}
-        
-        except FileNotFoundError:
-            return {"error": "Docker is not installed or not in PATH"}
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def restart_with_new_mounts(self):
-        """Stop, remove, and recreate container with updated mounts"""
-        # Stop and remove existing
-        subprocess.run(["docker", "stop", self.container_name], capture_output=True)
-        subprocess.run(["docker", "rm", self.container_name], capture_output=True)
-        
-        # Create with new mounts
-        return self._create_container()
-    
-    def exec(self, command):
-        """Execute command in the container. Auto-recovers if container not running."""
-        try:
-            result = subprocess.run(
-                ["docker", "exec", self.container_name, "sh", "-c", command],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace"  # Handle non-UTF-8 filenames gracefully
-            )
-
-            # Check if container doesn't exist or isn't running
-            if result.returncode != 0 and "No such container" in result.stderr:
-                # Try to start/create container and retry once
-                if self.working_dirs:
-                    start_result = self.start()
-                    if start_result.get("error"):
-                        return {"error": f"Container not running and failed to start: {start_result['error']}"}
-                    # Retry the command
-                    result = subprocess.run(
-                        ["docker", "exec", self.container_name, "sh", "-c", command],
-                        capture_output=True,
-                        encoding="utf-8",
-                        errors="replace"
-                    )
-                else:
-                    return {"error": "Container not running. Use action='start' to mount a directory first."}
-
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def stop(self):
-        """Stop the container (don't remove it)"""
-        if not self.container_exists():
-            return {"status": "not_found"}
-        
-        result = subprocess.run(
-            ["docker", "stop", self.container_name],
-            capture_output=True,
-            text=True
-        )
-        return {"status": "stopped" if result.returncode == 0 else "error"}
-    
-    def remove(self):
-        """Remove the container completely"""
-        subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
-        return {"status": "removed"}
-
 
 class CodingAgent:
-    """Minimal AI agent for coding workspace"""
+    """Minimal AI agent for coding workspace."""
 
-    # Model configurations from centralized config
     MODELS = config.models.aliases
 
-    # Summarization request template (summary only, no answer)
     SUMMARIZATION_TEMPLATE = """Summarize the conversation above.
 
 Preserve:
@@ -229,95 +41,89 @@ Preserve:
 
 You may use formatting (headers, code blocks, lists) to organize the summary."""
 
-    def __init__(self, tools, workspace_dir, debug_file=None, container_info=None, stream=False, think=False, model="gpt"):
-        # Store shorthand and resolve to full model ID
+    def __init__(
+        self,
+        tools,
+        workspace_dir,
+        debug_file=None,
+        container_info=None,
+        stream=False,
+        think=True,
+        model="gpt",
+    ):
         self.model_short = model
         self.model = self.MODELS.get(model, self.MODELS["gpt"])
 
-        # Get provider and per-model limits from config
         self.provider_name = config.models.get_provider(self.model)
         limits = config.models.get_limits(self.model)
         self.max_context_tokens = limits.max_context_tokens if limits else 200000
         self.max_output_tokens = limits.max_output_tokens if limits else 64000
 
-        # Create provider (handles both Anthropic and OpenAI)
-        self.provider = create_provider(self.model, self.provider_name)
+        self.provider = providers.create_provider(self.model, self.provider_name)
 
         self.workspace_dir = workspace_dir
         self.messages = []
         self.tools = tools
         self.tool_map = {tool.get_schema()["name"]: tool for tool in tools}
-        self.display_history = []  # Store original user inputs for resume display
-        self.stream = stream  # Enable streaming output
-        self.think = think  # Enable extended thinking
-
-        # Extended thinking budget from config (per-model)
+        self.display_history = []
+        self.stream = stream
+        self.think = think
         self.thinking_budget = config.models.get_thinking_budget(self.model)
-        
-        # Rate limit tracking (populated after first API call)
-        self.rate_limit_info = None  # Will store input/output/request limits and remaining
-        self.context_tokens = 0  # Current context size from last response
-        
-        # Cost tracking
-        self.session_cost = 0.0  # Total cost of entire conversation (including before resume)
-        self.run_cost = 0.0  # Cost since current run started (resets on resume)
-        self.last_req_cost = 0.0  # Cost of last API request
-        self.last_usage = None  # Last API usage tokens (for logging)
 
-        # Context management
-        self._dropped_turns_this_turn = False  # Track if we dropped turns due to context overflow
-        
-        # Setup debug log file and container
+        self.rate_limit_info = None
+        self.context_tokens = 0
+
+        self.session_cost = 0.0
+        self.run_cost = 0.0
+        self.last_req_cost = 0.0
+        self.last_usage = None
+
+        self._dropped_turns_this_turn = False
+
         if debug_file:
-            # Resume: use existing debug file
             self.debug_file = debug_file
-            
-            # Get container name from stored info (resilient to filename changes)
+            self.logger = SessionLogger(self.debug_file)
+
             if container_info and container_info.get("container_name"):
                 container_name = container_info["container_name"]
                 working_dirs = container_info.get("working_dirs", [])
             else:
-                # Fallback: derive from filename
                 debug_basename = os.path.basename(debug_file)
                 session_name = debug_basename.replace("debug_", "").replace(".txt", "")
                 container_name = f"agent_{session_name}"
                 working_dirs = []
-            
-            # Ensure workspace is in working_dirs for resume
+
             if workspace_dir not in working_dirs:
                 working_dirs.append(workspace_dir)
-            
-            self.container_manager = ContainerManager(
-                container_name=container_name,
-                working_dirs=working_dirs
-            )
-            # Track what was already logged (from previous session)
+
+            self.container_manager = ContainerManager(container_name=container_name, working_dirs=working_dirs)
             self._last_logged_container_info = container_info
-            self._log_resume()
+            self.logger.resume()
         else:
-            # New session: create new debug file
             debug_dir = os.path.join(workspace_dir, "debug")
             os.makedirs(debug_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.debug_file = os.path.join(debug_dir, f"debug_{timestamp}.txt")
-            
-            # Create new container manager with workspace pre-mounted
+            self.logger = SessionLogger(self.debug_file)
+
             self.container_manager = ContainerManager(
                 container_name=f"agent_{timestamp}",
-                working_dirs=[workspace_dir]  # Auto-mount workspace
+                working_dirs=[workspace_dir],
             )
-            # Track what was logged (None = nothing yet)
             self._last_logged_container_info = None
-            self._log_session_start()
-        
-        # Start container with workspace mounted
+            self.logger.session_start(self.workspace_dir, self.container_manager.container_name)
+
         self._ensure_container_started()
-        
-        # Build system message with mount info
         self._update_system_message()
-    
+
+
+    def _is_openai_model(self) -> bool:
+        """True if current model uses the OpenAI provider."""
+        return self.provider_name == "openai"
+
+    # ---- container + prompt ----
+
     def _ensure_container_started(self):
-        """Ensure the container is started with all mounts"""
         if self.container_manager.working_dirs:
             print(f"{Fore.YELLOW}🐳 Starting Docker container...{Style.RESET_ALL}")
             result = self.container_manager.start()
@@ -329,238 +135,468 @@ You may use formatting (headers, code blocks, lists) to organize the summary."""
             else:
                 print(f"{Fore.GREEN}🐳 Container ready: {self.container_manager.container_name}{Style.RESET_ALL}")
                 self._log_container_info()
-    
+
     def _update_system_message(self):
-        """Update system message with current mount mappings.
-        
-        The system prompt is designed to reach ~4500 tokens when combined with tools (~1113 tokens)
-        to meet minimum cacheable token requirements.
-        """
         mount_info = self.container_manager.get_mount_info()
-        
         if mount_info:
-            mount_section = get_mount_section_text(
-                self.container_manager.container_name,
-                mount_info
-            )
+            mount_section = get_mount_section_text(self.container_manager.container_name, mount_info)
         else:
             mount_section = get_no_mount_section_text()
-        
         self.system_prompt = get_system_prompt(self.workspace_dir, mount_section)
-    
+
     def add_working_directory(self, path):
-        """Add a working directory to the container. Returns status message."""
         needs_restart = self.container_manager.add_working_dir(path)
         mount_path = ContainerManager.convert_path(path, lowercase=True)
-        
         if not needs_restart:
             return {"status": "already_mounted", "mount_path": mount_path}
-        
-        # Need to restart container with new mount
-        result = (self.container_manager.restart_with_new_mounts() 
-                  if self.container_manager.container_running() 
-                  else self.container_manager.start())
-        
-        # Update system message and log container info
+
+        result = (
+            self.container_manager.restart_with_new_mounts()
+            if self.container_manager.container_running()
+            else self.container_manager.start()
+        )
+
         self._update_system_message()
         self._log_container_info()
-        
         result["mount_path"] = mount_path
         return result
-    
+
     def _log_container_info(self):
-        """Log container info to debug file only if changed since last log"""
         info = {
             "container_name": self.container_manager.container_name,
-            "working_dirs": self.container_manager.working_dirs
+            "working_dirs": self.container_manager.working_dirs,
         }
-        # Only log if different from last logged info
         if info != self._last_logged_container_info:
-            self._log_raw(f"\n=== CONTAINER INFO ===")
-            self._log_raw(json.dumps(info))
+            self.logger.container_info(info)
             self._last_logged_container_info = info
-    
-    def cleanup_empty_session(self):
-        """Clean up if no user messages. Returns True if cleaned up."""
-        # Check if there are any user messages in the conversation
-        has_user_message = any(
-            msg.get("role") == "user" and isinstance(msg.get("content"), str)
-            for msg in self.messages
-        )
-        
-        if has_user_message:
-            return False
-        
-        # Remove container
-        self.container_manager.remove()
-        
-        # Remove debug file
-        if os.path.exists(self.debug_file):
-            os.remove(self.debug_file)
-            print(f"{Fore.YELLOW}🧹 Cleaned up empty session{Style.RESET_ALL}")
-        
-        return True
-    
+
     def stop_container(self):
-        """Stop the container gracefully"""
         if self.container_manager.container_exists():
             self.container_manager.stop()
             print(f"{Fore.CYAN}🐳 Container stopped: {self.container_manager.container_name}{Style.RESET_ALL}")
 
-    def _log_session_start(self):
-        """Log session start with metadata"""
-        self._log_raw(f"=== SESSION START ===")
-        self._log_raw(f"Timestamp: {datetime.now().isoformat()}")
-        self._log_raw(f"Workspace: {self.workspace_dir}")
-        self._log_raw(f"Container: {self.container_manager.container_name}")
+    def cleanup_empty_session(self):
+        has_user_message = any(
+            msg.get("role") == "user" and isinstance(msg.get("content"), str) for msg in self.messages
+        )
+        if has_user_message:
+            return False
 
-    def _log_resume(self):
-        """Log resume marker"""
-        self._log_raw(f"\n=== RESUME ===")
-        self._log_raw(f"Timestamp: {datetime.now().isoformat()}")
+        self.container_manager.remove()
+        if os.path.exists(self.debug_file):
+            os.remove(self.debug_file)
+            print(f"{Fore.YELLOW}🧹 Cleaned up empty session{Style.RESET_ALL}")
+        return True
 
-    def _log_raw(self, message):
-        """Write raw message to log file"""
-        with open(self.debug_file, "a", encoding="utf-8") as f:
-            f.write(message + "\n")
-
-    def _log_turn_start(self, turn_num, user_input):
-        """Log start of a new turn with user input"""
-        self._log_raw(f"\n=== TURN {turn_num} ===")
-        self._log_raw(f"--- USER ---")
-        if isinstance(user_input, str):
-            self._log_raw(user_input)
-        else:
-            # Tool results
-            self._log_raw(json.dumps(user_input, indent=2, ensure_ascii=False))
-
-    def _log_assistant(self, content_list):
-        """Log assistant response immediately after API call"""
-        self._log_raw(f"\n--- ASSISTANT ---")
-        self._log_raw(json.dumps(content_list, indent=2, ensure_ascii=False))
-
-    def _log_req_cost(self):
-        """Log request usage tokens immediately after API call (for cost calculation on resume)"""
-        if self.last_usage:
-            usage_with_model = {"model": self.model_short, **self.last_usage}
-            self._log_raw(f"--- USAGE: {json.dumps(usage_with_model)} ---")
-
-    def _log_tool_results(self, tool_results):
-        """Log tool results immediately after execution"""
-        self._log_raw(f"\n--- TOOL_RESULT ---")
-        self._log_raw(json.dumps(tool_results, indent=2, ensure_ascii=False))
-
-    def _log_end_turn(self):
-        """Mark turn as complete"""
-        self._log_raw(f"\n--- END_TURN ---")
-
-    def _log_compaction(self, reason, removed_turns, summary_content):
-        """Log a compaction event"""
-        self._log_raw(f"\n=== COMPACTION EVENT ===")
-        self._log_raw(f"Reason: {reason}")
-        self._log_raw(f"Removed turns: {removed_turns}")
-        self._log_raw(f"Summary content:\n{summary_content}")
-
-    def _get_tool_schemas(self):
-        """Get tool schemas with cache_control on the last tool for prompt caching."""
-        schemas = [tool.get_schema() for tool in self.tools]
-        if schemas:
-            # Add cache_control to the last tool for caching
-            schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
-        return schemas
-    
-    def _get_system_with_cache(self):
-        """Get system message formatted for prompt caching.
-        
-        Returns system as an array with cache_control on the last block.
-        Cached tokens don't count toward rate limits!
-        """
-        return [
-            {
-                "type": "text",
-                "text": self.system_prompt,
-                "cache_control": {"type": "ephemeral"}
-            }
-        ]
+    # ---- token counting + context mgmt ----
 
     def _count_tokens(self, messages):
-        """Count tokens for given messages using provider."""
         try:
             tool_schemas = [tool.get_schema() for tool in self.tools]
-            return self.provider.count_tokens(
-                messages=messages,
-                system=self.system_prompt,
-                tools=tool_schemas
-            )
-        except Exception as e:
-            # Fallback: estimate ~4 chars per token
+            return self.provider.count_tokens(messages=messages, system=self.system_prompt, tools=tool_schemas)
+        except Exception:
             total_chars = len(self.system_prompt)
             for msg in messages:
-                if isinstance(msg.get("content"), str):
-                    total_chars += len(msg["content"])
-                elif isinstance(msg.get("content"), list):
-                    for item in msg["content"]:
+                c = msg.get("content")
+                if isinstance(c, str):
+                    total_chars += len(c)
+                elif isinstance(c, list):
+                    for item in c:
                         if isinstance(item, dict):
                             total_chars += len(json.dumps(item))
             return total_chars // 4
 
     def _get_turns(self):
-        """Split messages into turns (each turn starts with a user message)"""
         turns = []
         current_turn = []
-
         for msg in self.messages:
             if msg["role"] == "user" and current_turn:
-                # Check if this is a tool_result (part of current turn) or new user input
                 content = msg.get("content", "")
-                if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
-                    # Tool result - part of current turn
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") == "tool_result"
+                ):
                     current_turn.append(msg)
                 else:
-                    # New user message - start new turn
                     turns.append(current_turn)
                     current_turn = [msg]
             else:
                 current_turn.append(msg)
-
         if current_turn:
             turns.append(current_turn)
-
         return turns
 
-    def _drop_oldest_turn(self, tokens_to_remove=None, tokens_used=None):
-        """Drop oldest turn(s) from messages. Returns True if successful.
+    def _is_context_error(self, error):
+        error_str = str(error).lower()
+        return any(
+            x in error_str
+            for x in [
+                "context_length_exceeded",
+                "max_tokens",
+                "too many tokens",
+                "too long",
+                "maximum context length",
+                "context window",
+                "exceed",
+            ]
+        )
 
-        Args:
-            tokens_to_remove: If specified, drop enough turns to remove this many tokens.
-                              If None, drops 1 turn.
-            tokens_used: Actual token count from API error (for accurate avg calculation).
-        """
+    def _parse_context_error(self, error):
+        error_str = str(error)
+        anthropic_match = re.search(r"(\d+) tokens > (\d+) maximum", error_str)
+        if anthropic_match:
+            return int(anthropic_match.group(1)), int(anthropic_match.group(2))
+
+        used_match = re.search(r"resulted in (\d+) tokens", error_str)
+        if not used_match:
+            used_match = re.search(r"(\d+) tokens.*(?:exceed|over)", error_str, re.IGNORECASE)
+
+        limit_match = re.search(r"maximum context length is (\d+)", error_str)
+        if not limit_match:
+            limit_match = re.search(r"max.*?(\d+) tokens", error_str, re.IGNORECASE)
+
+        tokens_used = int(used_match.group(1)) if used_match else None
+        tokens_limit = int(limit_match.group(1)) if limit_match else None
+        return tokens_used, tokens_limit
+
+    def _estimate_tokens_per_turn(self, total_tokens=None):
+        turns = self._get_turns()
+        if len(turns) < 2:
+            return 10000
+        if total_tokens is None:
+            total_tokens = self._count_tokens(self.messages)
+        return max(1, total_tokens // len(turns))
+
+    def _drop_multiple_oldest_turns(self, tokens_to_remove=None, tokens_used=None):
+        turns = self._get_turns()
+        if len(turns) < 2:
+            return 0
+
+        if tokens_to_remove is None or tokens_to_remove <= 0:
+            first_turn_len = len(turns[0])
+            self.messages = self.messages[first_turn_len:]
+            self._dropped_turns_this_turn = True
+            self.logger.drop_turn_marker()
+            if config.ui.show_drop_indicator:
+                print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
+            return 1
+
+        avg_tokens_per_turn = self._estimate_tokens_per_turn(tokens_used)
+        tokens_with_buffer = int(tokens_to_remove * 1.5)
+        turns_to_drop = max(1, -(-tokens_with_buffer // avg_tokens_per_turn))
+        turns_to_drop = min(turns_to_drop, len(turns) - 1)
+
+        messages_to_remove = sum(len(turns[i]) for i in range(turns_to_drop))
+        self.messages = self.messages[messages_to_remove:]
+        self._dropped_turns_this_turn = True
+
+        self.logger.drop_turn_marker()
+        if config.ui.show_drop_indicator:
+            print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
+        return turns_to_drop
+
+    def _drop_oldest_turn(self, tokens_to_remove=None, tokens_used=None):
         return self._drop_multiple_oldest_turns(tokens_to_remove, tokens_used) > 0
 
+    # ---- provider/cost ----
+
+    def _capture_rate_limit_info(self, response):
+        if response and response.raw_response:
+            self.rate_limit_info = self.provider.get_rate_limit_info(response.raw_response)
+        else:
+            self.rate_limit_info = {}
+
+        if response and response.usage:
+            usage = response.usage
+            self.context_tokens = usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
+            self._calculate_cost(usage)
+            self._set_last_thought_tokens(response)
+
+    @staticmethod
+    def calculate_cost_from_usage(usage, model="claude-opus-4-5"):
+        pricing = config.models.pricing.get(model)
+        if not pricing:
+            return 0.0
+        return (
+            usage.get("input", 0) * pricing.input / 1_000_000
+            + usage.get("output", 0) * pricing.output / 1_000_000
+            + usage.get("cache_write", 0) * pricing.cache_write / 1_000_000
+            + usage.get("cache_read", 0) * pricing.cache_read / 1_000_000
+        )
+
+    def _calculate_cost(self, usage):
+        self.last_usage = {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "cache_write": usage.cache_creation_input_tokens,
+            "cache_read": usage.cache_read_input_tokens,
+            "reasoning": getattr(usage, "reasoning_tokens", 0),
+        }
+        self.last_req_cost = self.calculate_cost_from_usage(self.last_usage, self.model)
+        self.run_cost += self.last_req_cost
+        self.session_cost += self.last_req_cost
+
+    
+    def _set_last_thought_tokens(self, response) -> None:
+        """Compute last thought token count for UI.
+
+        OpenAI: uses response.usage.reasoning_tokens (from providers.OpenAIProvider).
+        Anthropic: no separate thinking token count, so we estimate from thinking text
+        length if a thinking block exists.
+        """
+        self._last_thought_tokens = 0
+
+        if response and getattr(response, "usage", None):
+            self._last_thought_tokens = int(getattr(response.usage, "reasoning_tokens", 0) or 0)
+
+        if self._last_thought_tokens <= 0 and response and getattr(response, "content", None):
+            for b in response.content:
+                if isinstance(b, dict) and b.get("type") == "thinking":
+                    t = b.get("thinking", "") or ""
+                    self._last_thought_tokens = max(1, len(t) // 4)
+                    return
+# ---- UI ----
+
+    def print_status(self):
+        effective_limit = self.max_context_tokens - self.max_output_tokens
+        if self.messages:
+            self.context_tokens = self._count_tokens(self.messages)
+
+        print_status_box(
+            divider_width=config.ui.divider_width,
+            run_cost=self.run_cost,
+            session_cost=self.session_cost,
+            rate_limit_info=self.rate_limit_info,
+            context_tokens=self.context_tokens,
+            effective_limit=effective_limit,
+        )
+
+    # ---- API calls ----
+
+    def _request_llm_once(self, *, tool_schemas, thinking_config, print_text: bool):
+        if self.stream:
+            return self._call_api_streaming(print_text=print_text, thinking_config=thinking_config)
+
+        response = self.provider.create(
+            messages=self.messages,
+            system=self.system_prompt,
+            tools=tool_schemas,
+            max_tokens=self.max_output_tokens,
+            thinking_config=thinking_config,
+        )
+        self._capture_rate_limit_info(response)
+        return response, response.content
+
+    def _call_api(self, print_text=True):
+        max_retries = config.agent.max_retries
+        tool_schemas = [tool.get_schema() for tool in self.tools]
+
+        thinking_config = None
+        if self.think:
+            thinking_config = {"type": "enabled", "budget_tokens": self.thinking_budget}
+
+        while True:
+            for attempt in range(max_retries + 1):
+                try:
+                    response, content_list = self._request_llm_once(
+                        tool_schemas=tool_schemas,
+                        thinking_config=thinking_config,
+                        print_text=print_text,
+                    )
+                    if print_text and not self.stream:
+                            self._print_content(content_list)
+                    return response, content_list
+
+                except Exception as e:
+                    error_str = str(e).lower()
+
+                    if self._is_context_error(e):
+                        tokens_used, _tokens_limit = self._parse_context_error(e)
+                        tokens_to_remove = None
+                        if tokens_used:
+                            effective_limit = self.max_context_tokens - self.max_output_tokens
+                            tokens_to_remove = tokens_used - effective_limit
+                        if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
+                            print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
+                            raise
+                        break
+
+                    if "rate" in error_str or "429" in error_str:
+                        if attempt == max_retries:
+                            print(
+                                f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}"
+                            )
+                            raise
+
+                        retry_after = None
+                        if hasattr(e, "response") and e.response is not None:
+                            retry_after = getattr(e.response.headers, "get", lambda _x: None)("retry-after")
+                        delay = int(retry_after) if retry_after else 30
+                        print(
+                            f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}"
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
+            else:
+                break
+
+    def _call_api_streaming(self, print_text=True, thinking_config=None):
+        from .stream_accumulator import StreamAccumulator
+
+        tool_schemas = [tool.get_schema() for tool in self.tools]
+
+        while True:
+            try:
+                stream_gen = self.provider.stream(
+                    messages=self.messages,
+                    system=self.system_prompt,
+                    tools=tool_schemas,
+                    max_tokens=self.max_output_tokens,
+                    thinking_config=thinking_config,
+                )
+
+                acc = StreamAccumulator(
+                    print_text=print_text,
+                    assistant_prefix=config.ui.prefixes.assistant,
+                    get_assistant_color=get_color,
+                    show_think_content=config.ui.show_think_content,
+                )
+
+                final_response = None
+                try:
+                    while True:
+                        acc.on_event(next(stream_gen))
+                except StopIteration as e:
+                    final_response = e.value
+
+                content_list = acc.content_list
+
+                if final_response:
+                    final_response.content = content_list
+                    self._capture_rate_limit_info(final_response)
+                return final_response, content_list
+
+            except Exception as e:
+                if self._is_context_error(e):
+                    tokens_used, _tokens_limit = self._parse_context_error(e)
+                    tokens_to_remove = None
+                    if tokens_used:
+                        effective_limit = self.max_context_tokens - self.max_output_tokens
+                        tokens_to_remove = tokens_used - effective_limit
+                    if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
+                        print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
+                        raise
+                    continue
+                raise
+
+    def chat(self, message):
+        self.messages.append({"role": "user", "content": message})
+        response, content_list = self._call_api()
+        self.messages.append({"role": "assistant", "content": content_list})
+        return response
+
+    def _print_content(self, content_list):
+        for block in content_list:
+            block_type = block.get("type")
+            if block_type == "thinking":
+                print(f"{Fore.MAGENTA}Thinking...{Style.RESET_ALL}")
+                if config.ui.show_think_content:
+                    t = block.get('thinking', '')
+                    if t:
+                        print(f"{get_color('thinking')}{t}{Style.RESET_ALL}")
+            elif block_type == "text":
+                text = block.get("text", "")
+                if text:
+                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
+
+    # ---- tool execution + response processing ----
+
+    def _ensure_thinking_blocks(self):
+        for msg in self.messages:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    msg["content"] = [
+                        block
+                        for block in content
+                        if block.get("type") != "thinking" or block.get("signature")
+                    ]
+
+    def _execute_tools(self, response, prefix=""):
+        from .tool_exec import execute_tool_uses
+
+        def _print(line: str, path: str | None = None) -> None:
+            if path:
+                tool_color = get_color('tool')
+                path_color = get_color('tool_path')
+                print(f"{tool_color}{line}{Style.RESET_ALL} {path_color}(In {path}){Style.RESET_ALL}")
+            else:
+                print(f"{get_color('tool')}{line}{Style.RESET_ALL}")
+
+        tool_results = execute_tool_uses(
+            tool_uses=response.content,
+            tool_map=self.tool_map,
+            describe=get_tool_description,
+            print_line=_print,
+            prefix=prefix,
+        )
+
+        for block in response.content:
+            if block.get("type") == "tool_use":
+                description, path = get_tool_description(block["name"], block["input"])
+                # Store description with path for display history
+                full_desc = f"{description} (In {path})" if path else description
+                self.display_history.append(("tool", full_desc))
+
+        for tr in tool_results:
+            try:
+                parsed = json.loads(tr["content"])
+            except Exception:
+                parsed = {"error": "Tool returned non-JSON"}
+                tr["content"] = json.dumps(parsed)
+            if isinstance(parsed, dict) and "error" in parsed:
+                print(f"{Fore.RED}  \u2717 Error: {parsed['error']}{Style.RESET_ALL}")
+
+        return tool_results
+
+    def _process_response(self, content_list):
+        agent_texts = []
+        found_thinking = False
+        for block in content_list:
+            if block.get("type") == "thinking":
+                found_thinking = True
+                self.display_history.append(("thinking", "🧠 Thinking..."))
+                if not self.stream:
+                    print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
+            elif block.get("type") == "text":
+                if not self.stream:
+                    print(f"{Fore.GREEN}Agent: {block['text']}{Style.RESET_ALL}")
+                agent_texts.append(block["text"])
+        return agent_texts
+
+    # ---- compaction ----
+
     def _compact_after_turn(self):
-        """Compact context after a turn completes (called when we dropped turns during the turn)."""
-        # Divider after agent response, before compacting
         print()
-        print_divider()
+        print_divider(config.ui.divider_width)
         print()
         print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
 
-        # Build summarization request
         sr_message = {"role": "user", "content": self.SUMMARIZATION_TEMPLATE}
         messages_with_sr = self.messages + [sr_message]
 
         try:
-            # Call API with streaming (required for long operations)
             tool_schemas = [tool.get_schema() for tool in self.tools]
             stream_gen = self.provider.stream(
                 messages=messages_with_sr,
                 system=self.system_prompt,
                 tools=tool_schemas,
-                max_tokens=self.max_output_tokens
+                max_tokens=self.max_output_tokens,
             )
 
-            # Consume stream and collect text content
             summary_text = ""
             final_response = None
             try:
@@ -571,631 +607,61 @@ You may use formatting (headers, code blocks, lists) to organize the summary."""
             except StopIteration as e:
                 final_response = e.value
 
-            # Track cost from compaction request
             if final_response:
                 self._capture_rate_limit_info(final_response)
 
-            # Log compaction with usage
             num_turns = len(self._get_turns())
-            self._log_compaction(
+            self.logger.compaction(
                 "Post-turn compaction after context overflow",
                 f"1-{num_turns}",
-                summary_text
+                summary_text,
             )
-            self._log_raw("")  # Blank line separator
-            self._log_req_cost()  # Log USAGE after compaction event
+            self.logger.raw("")
+            self.logger.req_usage(self.model_short, self.last_usage)
 
-            # Replace messages with summary as single user message
             self.messages = [{"role": "user", "content": summary_text}]
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "I understand the context and will continue helping with your request.",
+                        }
+                    ],
+                }
+            )
 
-            # Add the assistant acknowledgment so conversation can continue
-            self.messages.append({
-                "role": "assistant",
-                "content": [{"type": "text", "text": "I understand the context and will continue helping with your request."}]
-            })
-
-            # Display summary if configured
             if config.ui.show_compact_content:
                 print(f"{get_color('system')}{summary_text}{Style.RESET_ALL}")
-            # No divider here - print_status() will add one
 
         except Exception as e:
-            print(f"{Fore.RED}⚠️ Compaction failed: {e}{Style.RESET_ALL}")
-            self._log_raw(f"Compaction error: {e}")
+            print(f"{Fore.RED}⚠️  Compaction failed: {e}{Style.RESET_ALL}")
+            self.logger.raw(f"Compaction error: {e}")
 
-    def chat(self, message):
-        """Send message to LLM and update messages array"""
-        self.messages.append({"role": "user", "content": message})
-        response, content_list = self._call_api()
-        self.messages.append({"role": "assistant", "content": content_list})
-        return response
-    
-    def _is_context_error(self, error):
-        """Check if error is a context length exceeded error."""
-        error_str = str(error).lower()
-        return any(x in error_str for x in [
-            "context_length_exceeded",
-            "max_tokens",
-            "too many tokens",
-            "too long",  # Anthropic: "prompt is too long"
-            "maximum context length",
-            "context window",
-            "exceed"
-        ])
-
-    def _parse_context_error(self, error):
-        """Parse token counts from context length error message.
-
-        OpenAI errors typically look like:
-        "This model's maximum context length is 400000 tokens. However, your messages resulted in 450000 tokens."
-
-        Anthropic errors look like:
-        "prompt is too long: 208930 tokens > 200000 maximum"
-
-        Returns:
-            tuple: (tokens_used, tokens_limit) or (None, None) if cannot parse
-        """
-        error_str = str(error)
-
-        # Try Anthropic format first: "208930 tokens > 200000 maximum"
-        anthropic_match = re.search(r'(\d+) tokens > (\d+) maximum', error_str)
-        if anthropic_match:
-            return int(anthropic_match.group(1)), int(anthropic_match.group(2))
-
-        # Try OpenAI format: "resulted in 450000 tokens" and "maximum context length is 400000"
-        used_match = re.search(r'resulted in (\d+) tokens', error_str)
-        if not used_match:
-            used_match = re.search(r'(\d+) tokens.*(?:exceed|over)', error_str, re.IGNORECASE)
-
-        limit_match = re.search(r'maximum context length is (\d+)', error_str)
-        if not limit_match:
-            limit_match = re.search(r'max.*?(\d+) tokens', error_str, re.IGNORECASE)
-
-        tokens_used = int(used_match.group(1)) if used_match else None
-        tokens_limit = int(limit_match.group(1)) if limit_match else None
-
-        return tokens_used, tokens_limit
-
-    def _estimate_tokens_per_turn(self, total_tokens=None):
-        """Estimate average tokens per turn based on current messages.
-
-        Args:
-            total_tokens: If provided, use this as total (from API error message).
-                          Otherwise, calculate using provider's count_tokens.
-        """
-        turns = self._get_turns()
-        if len(turns) < 2:
-            return 10000  # Default estimate if only 1 turn
-
-        # Use provided total or calculate
-        if total_tokens is None:
-            total_tokens = self._count_tokens(self.messages)
-
-        return max(1, total_tokens // len(turns))
-
-    def _drop_multiple_oldest_turns(self, tokens_to_remove=None, tokens_used=None):
-        """Drop oldest turns to remove at least tokens_to_remove tokens.
-
-        Args:
-            tokens_to_remove: Target tokens to remove. If None, drops 1 turn.
-            tokens_used: Actual token count from API error (for accurate avg calculation).
-
-        Returns:
-            int: Number of turns actually dropped, 0 if cannot drop
-        """
-        turns = self._get_turns()
-        if len(turns) < 2:
-            return 0  # Can't drop if less than 2 turns
-
-        # If no target specified, drop 1 turn
-        if tokens_to_remove is None or tokens_to_remove <= 0:
-            first_turn_len = len(turns[0])
-            self.messages = self.messages[first_turn_len:]
-            self._dropped_turns_this_turn = True
-            self._log_raw(f"--- DROP_TURN ---")
-            if config.ui.show_drop_indicator:
-                print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
-            return 1
-
-        # Use actual token count from API error for accurate estimation
-        avg_tokens_per_turn = self._estimate_tokens_per_turn(tokens_used)
-
-        # Use ceiling division and add buffer for safety
-        # Old turns might be smaller than average, so we add 50% buffer
-        tokens_with_buffer = int(tokens_to_remove * 1.5)
-        turns_to_drop = max(1, -(-tokens_with_buffer // avg_tokens_per_turn))  # Ceiling division
-
-        # Don't drop more than available (keep at least 1 turn)
-        turns_to_drop = min(turns_to_drop, len(turns) - 1)
-
-        # Calculate total messages to remove
-        messages_to_remove = sum(len(turns[i]) for i in range(turns_to_drop))
-        self.messages = self.messages[messages_to_remove:]
-        self._dropped_turns_this_turn = True
-
-        # Log single DROP_TURN marker (not one per turn)
-        self._log_raw(f"--- DROP_TURN ---")
-
-        if config.ui.show_drop_indicator:
-            print(f"{Fore.YELLOW}📦 Compacting...{Style.RESET_ALL}")
-
-        return turns_to_drop
-
-    def _call_api(self, print_text=True):
-        """Call LLM API with current messages. Does NOT modify self.messages.
-
-        Implements retry for:
-        - Rate limit errors: using retry-after header
-        - Context length errors: by dropping oldest turn and retrying
-
-        Supports streaming and extended thinking based on instance flags.
-
-        Args:
-            print_text: Whether to print text responses (True for run(), False for chat())
-
-        Returns:
-            tuple: (response, content_list) where content_list is serializable format
-        """
-        max_retries = config.agent.max_retries
-        tool_schemas = [tool.get_schema() for tool in self.tools]
-
-        # Build thinking config if enabled
-        thinking_config = None
-        if self.think:
-            thinking_config = {
-                "type": "enabled",
-                "budget_tokens": self.thinking_budget
-            }
-
-        while True:
-            for attempt in range(max_retries + 1):
-                try:
-                    if self.stream:
-                        return self._call_api_streaming(print_text, thinking_config)
-                    else:
-                        response = self.provider.create(
-                            messages=self.messages,
-                            system=self.system_prompt,
-                            tools=tool_schemas,
-                            max_tokens=self.max_output_tokens,
-                            thinking_config=thinking_config
-                        )
-                        # Success - capture rate limit info and return
-                        self._capture_rate_limit_info(response)
-                        content_list = response.content
-                        if print_text:
-                            self._print_content(content_list)
-                        return response, content_list
-                except Exception as e:
-                    error_str = str(e).lower()
-
-                    # Handle context length errors - drop oldest turn(s) and retry
-                    if self._is_context_error(e):
-                        # Try to parse token counts to drop multiple turns at once
-                        tokens_used, tokens_limit = self._parse_context_error(e)
-                        tokens_to_remove = None
-                        if tokens_used:
-                            # Use effective input limit (must reserve space for output)
-                            effective_limit = self.max_context_tokens - self.max_output_tokens
-                            tokens_to_remove = tokens_used - effective_limit
-                        if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
-                            print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
-                            raise
-                        # Break inner loop to retry with dropped turn(s)
-                        break
-
-                    # Handle rate limit errors
-                    if "rate" in error_str or "429" in error_str:
-                        if attempt == max_retries:
-                            print(f"{Fore.RED}Rate limit exceeded after {max_retries + 1} attempts{Style.RESET_ALL}")
-                            raise
-                        # Get retry-after from response headers if available, fallback to 30s
-                        retry_after = None
-                        if hasattr(e, 'response') and e.response is not None:
-                            retry_after = getattr(e.response.headers, 'get', lambda x: None)("retry-after")
-                        delay = int(retry_after) if retry_after else 30
-                        print(f"{Fore.YELLOW}⏳ Rate limited, waiting {delay}s before retry ({attempt + 1}/{max_retries})...{Style.RESET_ALL}")
-                        time.sleep(delay)
-                    else:
-                        raise
-            else:
-                # Inner loop completed without break - shouldn't reach here for non-streaming
-                # (non-streaming returns directly on success)
-                break
-
-    def _call_api_streaming(self, print_text=True, thinking_config=None):
-        """Handle streaming API call with real-time text output.
-
-        Text is streamed character-by-character.
-        Tool use blocks are accumulated and shown when complete.
-        Thinking blocks just show "Thinking..." indicator.
-
-        Handles context length errors by dropping oldest turn and retrying.
-        """
-        tool_schemas = [tool.get_schema() for tool in self.tools]
-
-        while True:  # Retry loop for context errors
-            # Reset state for each attempt
-            content_list = []
-            current_text = ""
-            current_thinking = ""
-            current_thinking_signature = ""
-            current_tool_use = None
-            tool_input_json = ""
-            thinking_shown = False
-            text_started = False
-            final_response = None
-
-            try:
-                # Get stream generator from provider
-                stream_gen = self.provider.stream(
-                    messages=self.messages,
-                    system=self.system_prompt,
-                    tools=tool_schemas,
-                    max_tokens=self.max_output_tokens,
-                    thinking_config=thinking_config
-                )
-
-                # Use manual iteration to capture generator's return value
-                # (for loop discards StopIteration.value)
-                try:
-                    while True:
-                        event = next(stream_gen)
-
-                        if event.type == "thinking_start":
-                            current_thinking = ""
-                            current_thinking_signature = ""
-                            if not thinking_shown and print_text:
-                                print(f"{get_color('thinking')}Thinking...{Style.RESET_ALL}")
-                                thinking_shown = True
-
-                        elif event.type == "text_start":
-                            if print_text:
-                                print(f"{get_color('assistant')}{config.ui.prefixes.assistant}{Style.RESET_ALL} ", end="", flush=True)
-                            text_started = True
-
-                        elif event.type == "tool_use_start":
-                            current_tool_use = {
-                                "id": event.data["id"],
-                                "name": event.data["name"],
-                                "input": {}
-                            }
-                            tool_input_json = ""
-
-                        elif event.type == "thinking_delta":
-                            current_thinking += event.data
-
-                        elif event.type == "signature_delta":
-                            current_thinking_signature += event.data
-
-                        elif event.type == "text_delta":
-                            current_text += event.data
-                            if print_text:
-                                print(f"{get_color('assistant')}{event.data}", end="", flush=True)
-
-                        elif event.type == "tool_input_delta":
-                            tool_input_json += event.data
-
-                        elif event.type == "content_block_stop":
-                            # Store thinking block if we accumulated any
-                            if current_thinking or current_thinking_signature:
-                                thinking_block = {"type": "thinking", "thinking": current_thinking}
-                                if current_thinking_signature:
-                                    thinking_block["signature"] = current_thinking_signature
-                                content_list.append(thinking_block)
-                                current_thinking = ""
-                                current_thinking_signature = ""
-                            if current_text:
-                                content_list.append({"type": "text", "text": current_text})
-                                if print_text and text_started:
-                                    print(Style.RESET_ALL)
-                                current_text = ""
-                                text_started = False
-                            if current_tool_use:
-                                try:
-                                    current_tool_use["input"] = json.loads(tool_input_json) if tool_input_json else {}
-                                except json.JSONDecodeError:
-                                    current_tool_use["input"] = {}
-                                content_list.append({
-                                    "type": "tool_use",
-                                    "id": current_tool_use["id"],
-                                    "name": current_tool_use["name"],
-                                    "input": current_tool_use["input"]
-                                })
-                                current_tool_use = None
-                                tool_input_json = ""
-
-                except StopIteration as e:
-                    final_response = e.value
-
-                # Success - return response
-                if final_response:
-                    final_response.content = content_list
-                    self._capture_rate_limit_info(final_response)
-                return final_response, content_list
-
-            except Exception as e:
-                # Handle context length errors - drop oldest turn(s) and retry
-                if self._is_context_error(e):
-                    # Try to parse token counts to drop multiple turns at once
-                    tokens_used, tokens_limit = self._parse_context_error(e)
-                    tokens_to_remove = None
-                    if tokens_used:
-                        # Use effective input limit (must reserve space for output)
-                        effective_limit = self.max_context_tokens - self.max_output_tokens
-                        tokens_to_remove = tokens_used - effective_limit
-                    if not self._drop_oldest_turn(tokens_to_remove, tokens_used):
-                        print(f"{Fore.RED}Context limit exceeded but cannot drop more turns{Style.RESET_ALL}")
-                        raise
-                    # Continue to retry with dropped turn(s)
-                    continue
-                raise
-    
-    def _capture_rate_limit_info(self, response):
-        """Capture rate limit info from API response and calculate cost."""
-        # Use provider to extract rate limit info
-        if response and response.raw_response:
-            self.rate_limit_info = self.provider.get_rate_limit_info(response.raw_response)
-        else:
-            self.rate_limit_info = {}
-
-        # Track context usage and calculate cost from response
-        if response and response.usage:
-            usage = response.usage
-            # Total context = all input tokens used
-            self.context_tokens = (
-                usage.input_tokens
-                + usage.cache_creation_input_tokens
-                + usage.cache_read_input_tokens
-            )
-            # Calculate cost
-            self._calculate_cost(usage)
-    
-    @staticmethod
-    def calculate_cost_from_usage(usage, model="claude-opus-4-5"):
-        """Calculate cost from usage dict. Usage keys: input, output, cache_write, cache_read"""
-        pricing = config.models.pricing.get(model)
-        if not pricing:
-            return 0.0
-        return (
-            usage.get("input", 0) * pricing.input / 1_000_000
-            + usage.get("output", 0) * pricing.output / 1_000_000
-            + usage.get("cache_write", 0) * pricing.cache_write / 1_000_000
-            + usage.get("cache_read", 0) * pricing.cache_read / 1_000_000
-        )
-    
-    def _calculate_cost(self, usage):
-        """Calculate cost from API usage and update session totals.
-
-        Args:
-            usage: Usage dataclass with input_tokens, output_tokens,
-                   cache_creation_input_tokens, cache_read_input_tokens
-        """
-        self.last_usage = {
-            "input": usage.input_tokens,
-            "output": usage.output_tokens,
-            "cache_write": usage.cache_creation_input_tokens,
-            "cache_read": usage.cache_read_input_tokens
-        }
-        self.last_req_cost = self.calculate_cost_from_usage(self.last_usage, self.model)
-        self.run_cost += self.last_req_cost
-        self.session_cost += self.last_req_cost
-    
-    def _format_token_count(self, count):
-        """Format token count with K suffix for large numbers"""
-        if count >= 1000:
-            return f"{count/1000:.0f}K"
-        return str(count)
-    
-    def print_status(self):
-        """Print rate limit, cost, and context usage status with visual separator"""
-        inner_width = DIVIDER_WIDTH - 2  # Account for side borders
-        
-        # Cost line: run_cost = since this run started, session_cost = total conversation
-        cost_line = f"💰 Cost: ${self.run_cost:.4f} (total: ${self.session_cost:.4f})"
-        
-        # Requests rate limit
-        if self.rate_limit_info and self.rate_limit_info.get("request_limit") and self.rate_limit_info.get("request_remaining") is not None:
-            rl = self.rate_limit_info
-            req_used = rl["request_limit"] - rl["request_remaining"]
-            req_pct = (req_used / rl["request_limit"]) * 100
-            req_str = f"{req_used}/{rl['request_limit']} ({req_pct:.0f}%)"
-        else:
-            req_str = "N/A"
-        
-        # Input rate limit (show used/limit with K suffix)
-        if self.rate_limit_info and self.rate_limit_info.get("input_limit") and self.rate_limit_info.get("input_remaining") is not None:
-            rl = self.rate_limit_info
-            input_used = rl["input_limit"] - rl["input_remaining"]
-            input_pct = (input_used / rl["input_limit"]) * 100
-            input_str = f"{self._format_token_count(input_used)}/{self._format_token_count(rl['input_limit'])} ({input_pct:.0f}%)"
-        else:
-            input_str = "N/A"
-        
-        # Output rate limit (show used/limit with K suffix)
-        if self.rate_limit_info and self.rate_limit_info.get("output_limit") and self.rate_limit_info.get("output_remaining") is not None:
-            rl = self.rate_limit_info
-            output_used = rl["output_limit"] - rl["output_remaining"]
-            output_pct = (output_used / rl["output_limit"]) * 100
-            output_str = f"{self._format_token_count(output_used)}/{self._format_token_count(rl['output_limit'])} ({output_pct:.0f}%)"
-        else:
-            output_str = "N/A"
-        
-        rate_line = f"📊 Requests: {req_str} | Input: {input_str} | Output: {output_str}"
-
-        # Context usage - show effective input limit (max_context - max_output)
-        # This is the actual input limit because output tokens must be reserved
-        if self.messages:
-            self.context_tokens = self._count_tokens(self.messages)
-
-        effective_limit = self.max_context_tokens - self.max_output_tokens
-        context_pct = (self.context_tokens / effective_limit) * 100
-        context_line = f"🧠 Context: {self.context_tokens:,}/{effective_limit:,} ({context_pct:.0f}%)"
-        
-        # Print separator and box
-        print()  # Blank line for spacing
-        print_divider()
-        print(f"{Style.DIM}╭{'─' * inner_width}╮{Style.RESET_ALL}")
-        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {cost_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
-        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {rate_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
-        print(f"{Style.DIM}│{Style.RESET_ALL}{Fore.CYAN} {context_line.ljust(inner_width - 1)}{Style.DIM}│{Style.RESET_ALL}")
-        print(f"{Style.DIM}╰{'─' * inner_width}╯{Style.RESET_ALL}")
-        print()  # Blank line before user prompt
-    
-    def _print_content(self, content_list):
-        """Print content from normalized content list."""
-        for block in content_list:
-            block_type = block.get("type")
-            if block_type == "thinking":
-                print(f"{Fore.MAGENTA}Thinking...{Style.RESET_ALL}")
-            elif block_type == "text":
-                text = block.get("text", "")
-                if text:
-                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {text}")
-
-    def _response_to_content_list(self, response, print_text=True):
-        """Convert response.content to serializable format and optionally print text.
-
-        Note: This method is for backward compatibility. New code should use
-        provider.create() which returns normalized content directly.
-        """
-        content_list = []
-        for block in response.content:
-            if isinstance(block, dict):
-                # Already normalized format
-                content_list.append(block)
-                if print_text:
-                    self._print_content([block])
-            elif block.type == "thinking":
-                # Store thinking block with signature for resume capability
-                thinking_block = {"type": "thinking", "thinking": block.thinking}
-                if hasattr(block, 'signature') and block.signature:
-                    thinking_block["signature"] = block.signature
-                content_list.append(thinking_block)
-                if print_text:
-                    print(f"{Fore.MAGENTA}Thinking...{Style.RESET_ALL}")
-            elif hasattr(block, 'text'):
-                content_list.append({"type": "text", "text": block.text})
-                if print_text:
-                    print(f"{Fore.GREEN}Agent:{Style.RESET_ALL} {block.text}")
-            elif block.type == "tool_use":
-                content_list.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input
-                })
-        return content_list
-    
-    def _ensure_thinking_blocks(self):
-        """Ensure thinking blocks are valid for API submission.
-        
-        When resuming with thinking enabled, thinking blocks must have valid signatures.
-        This method removes any thinking blocks that lack signatures (from old non-thinking
-        sessions or corrupted data). The API accepts messages without thinking blocks
-        for non-tool-result user messages.
-        """
-        for msg in self.messages:
-            if msg.get("role") == "assistant":
-                content = msg.get("content", [])
-                if isinstance(content, list):
-                    # Filter out thinking blocks without valid signatures
-                    msg["content"] = [
-                        block for block in content
-                        if block.get("type") != "thinking" or block.get("signature")
-                    ]
-
-    def _execute_tools(self, response, prefix=""):
-        """Execute tool calls from response and return tool_results.
-
-        Args:
-            response: API response containing tool_use blocks (normalized dict format)
-            prefix: Optional prefix for display (e.g., "(Executing) " for resume)
-
-        Returns:
-            list: Tool results ready to be added to messages
-        """
-        tool_results = []
-        for block in response.content:
-            if block.get("type") == "tool_use":
-                tool_name = block["name"]
-                tool_input = block["input"]
-
-                description = get_tool_description(tool_name, tool_input)
-                print(f"{get_color('tool')}{prefix}{description}{Style.RESET_ALL}")
-                self.display_history.append(("tool", description))
-
-                tool = self.tool_map[tool_name]
-                result = tool.execute(**tool_input)
-
-                if result is None:
-                    result = {"error": "Tool returned None"}
-                if "error" in result:
-                    print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block["id"],
-                    "content": json.dumps(result)
-                })
-        return tool_results
-
-    def _process_response(self, response, content_list):
-        """Process response content - print if not streaming, update display history.
-        
-        Args:
-            response: API response object
-            content_list: Serialized content list from response
-        
-        Returns:
-            list: Text blocks from the response
-        """
-        agent_texts = []
-        for block in content_list:
-            if block.get("type") == "thinking":
-                self.display_history.append(("thinking", "🧠 Thinking..."))
-                if not self.stream:
-                    print(f"{Fore.MAGENTA}🧠 Thinking...{Style.RESET_ALL}")
-            elif block.get("type") == "text":
-                if not self.stream:
-                    print(f"{Fore.GREEN}Agent: {block['text']}{Style.RESET_ALL}")
-                agent_texts.append(block["text"])
-        return agent_texts
+    # ---- run loop ----
 
     def run(self, user_input, max_turns=None, initial_messages=None, display_history=None):
-        """Main agent loop
-
-        Args:
-            user_input: The user's input message
-            max_turns: Maximum number of tool-use turns
-            initial_messages: Optional messages to restore from a previous session
-            display_history: Optional display history for resume functionality
-        """
-        # Reset dropped turns flag for this turn
         self._dropped_turns_this_turn = False
 
-        # Initialize from previous session if provided
         if initial_messages is not None:
             self.messages = initial_messages
         if display_history is not None:
             self.display_history = display_history
 
-        # Store original user input for display history
         self.display_history.append(("user", user_input))
 
-        # If thinking is enabled, ensure all assistant messages have thinking blocks
         if self.think and self.messages:
             self._ensure_thinking_blocks()
 
         turn_num = len([h for h in self.display_history if h[0] == "user"])
-        self._log_turn_start(turn_num, user_input)
+        self.logger.turn_start(turn_num, user_input)
 
         if max_turns is None:
             max_turns = config.agent.max_turns
 
         response = self._agent_loop(user_input, max_turns)
 
-        # Compact context if we dropped turns during this turn
         if self._dropped_turns_this_turn:
             self._compact_after_turn()
             self._dropped_turns_this_turn = False
@@ -1203,95 +669,68 @@ You may use formatting (headers, code blocks, lists) to organize the summary."""
         return response
 
     def _agent_loop(self, initial_input, max_turns):
-        """Core agent loop for processing messages and tool calls.
-        
-        Args:
-            initial_input: User message or tool_results to start with (None to skip first chat)
-            max_turns: Maximum iterations
-        
-        Returns:
-            Final API response
-        """
         current_input = initial_input
-        
+        response = None
+
         for _ in range(max_turns):
-            # Call API
             if current_input is not None:
                 response = self.chat(current_input)
-                content_list = self.messages[-1]["content"]  # chat() already appended
+                content_list = self.messages[-1]["content"]
             else:
-                # Direct API call (for continue_incomplete_turn)
                 response, content_list = self._call_api()
                 self.messages.append({"role": "assistant", "content": content_list})
-            
-            # Log and process response
-            self._log_assistant(content_list)
-            self._log_req_cost()
-            agent_texts = self._process_response(response, content_list)
-            
+
+            self.logger.assistant(content_list)
+            self.logger.req_usage(self.model_short, self.last_usage)
+            agent_texts = self._process_response(content_list)
+
             if response.stop_reason == "tool_use":
                 tool_results = self._execute_tools(response)
-                self._log_tool_results(tool_results)
+                self.logger.tool_results(tool_results)
                 current_input = tool_results
             else:
-                self._log_end_turn()
+                self.logger.end_turn()
                 if agent_texts:
                     self.display_history.append(("assistant", "\n".join(agent_texts)))
                 return response
-        
+
         print(f"{Fore.RED}Max turns reached{Style.RESET_ALL}")
-        self._log_raw("Max turns reached")
+        self.logger.raw("Max turns reached")
         return response
 
     def continue_incomplete_turn(self, incomplete_turn, max_turns=None):
-        """Continue an incomplete turn from a crash
-        
-        Args:
-            incomplete_turn: dict with 'type' and relevant data
-                - {"type": "continue"} - messages already has tool_results, just call API
-                - {"type": "execute_tools", "tool_uses": [...]} - execute tools, add to messages, then call API
-            max_turns: Maximum remaining tool-use iterations
-        """
         if incomplete_turn["type"] == "execute_tools":
-            # Execute tools that weren't run before crash
-            tool_results = []
-            for tool_use in incomplete_turn["tool_uses"]:
-                description = get_tool_description(tool_use["name"], tool_use["input"])
-                print(f"{Fore.YELLOW}(Resuming) {description}{Style.RESET_ALL}")
-                
-                result = self.tool_map[tool_use["name"]].execute(**tool_use["input"])
-                if "error" in result:
-                    print(f"{Fore.RED}  ✗ Error: {result['error']}{Style.RESET_ALL}")
-                
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use["id"],
-                    "content": json.dumps(result)
-                })
-            
+            class _Tmp:
+                def __init__(self, content):
+                    self.content = content
+
+            tmp_response = _Tmp(incomplete_turn.get("tool_uses", []))
+            tool_results = self._execute_tools(tmp_response, prefix="(Resuming) ")
             self.messages.append({"role": "user", "content": tool_results})
-            self._log_tool_results(tool_results)
-            
+            self.logger.tool_results(tool_results)
+
         elif incomplete_turn["type"] != "continue":
             print(f"{Fore.RED}Unknown incomplete turn type: {incomplete_turn['type']}{Style.RESET_ALL}")
             return None
-        
-        # Ensure thinking blocks are valid
+
         if self.think:
             self._ensure_thinking_blocks()
 
         if max_turns is None:
             max_turns = config.agent.max_turns
-        # Continue with agent loop (pass None to skip first chat call)
+
         return self._agent_loop(None, max_turns)
 
     def get_state_for_resume(self):
-        """Get current state for saving/resuming"""
         return {
             "messages": self.messages,
             "display_history": self.display_history,
             "container_info": {
                 "container_name": self.container_manager.container_name,
-                "working_dirs": self.container_manager.working_dirs
-            }
+                "working_dirs": self.container_manager.working_dirs,
+            },
         }
+
+    def _log_end_turn(self):
+        """Mark current turn as ended (e.g., due to interruption)."""
+        self.logger.end_turn()

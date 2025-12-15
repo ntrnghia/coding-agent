@@ -1,133 +1,142 @@
-import subprocess
-import os
 import re
-from ddgs import DDGS
+import subprocess
+
 import requests
 from bs4 import BeautifulSoup
+from ddgs import DDGS
+
 from .config import config
 
 
-
 def _split_cd_prefix(cmd: str) -> tuple[str | None, str]:
-    """Extract (cwd, remainder) from `cd <cwd> && <remainder>` (or `;`).
-
-    Supports multiline remainder.
-    """
+    """Extract (cwd, remainder) from `cd <cwd> && <remainder>` (or `;`)."""
     cmd = cmd.strip()
     m = re.match(r"^cd\s+([^\n]+?)\s*(?:&&|;)\s*(.+)$", cmd, flags=re.S)
     if not m:
         return None, cmd
+
     cwd = m.group(1).strip().strip('"').strip("'")
     remainder = m.group(2).strip()
     return cwd, remainder
 
 
-def _with_in_suffix(desc: str, cwd: str | None) -> str:
-    """Append the (In <cwd>) block when cwd is known."""
+def _describe_tool_exec(cmd: str) -> str:
+    cwd, remainder = _split_cd_prefix(cmd)
+    desc = _parse_exec_command(remainder)
     return f"{desc} (In {cwd})" if cwd else desc
 
 
+def _describe_tool_exec_tuple(cmd: str) -> tuple[str, str | None]:
+    """Helper for docker_sandbox exec - returns (description, path)."""
+    cwd, remainder = _split_cd_prefix(cmd)
+    desc = _parse_exec_command(remainder)
+    return (desc, cwd)
+
+
+def _short(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + "..."
+
+
 def get_tool_description(tool_name, tool_input):
-    """Convert tool call to human-readable description for display"""
+    """Convert tool call to human-readable description.
+
+    Returns:
+        tuple[str, str | None]: (description, path) where path is the working directory or None
+    """
     if tool_name == "docker_sandbox":
         action = tool_input.get("action", "")
         if action == "start":
+            return (f"🐳 Mount directory: {tool_input.get('mount_path', '')}", None)
+        if action == "exec":
+            return _describe_tool_exec_tuple(tool_input.get("command", ""))
+        if action == "stop":
             path = tool_input.get("mount_path", "")
-            return f"🐳 Mount directory: {path}"
-        elif action == "exec":
-            cmd = tool_input.get("command", "")
-            cwd, remainder = _split_cd_prefix(cmd)
-            return _with_in_suffix(_parse_exec_command(remainder), cwd)
-        elif action == "stop":
-            path = tool_input.get("mount_path", "")
-            if path:
-                return f"🐳 Stop container: {path}"
-            return "🐳 Stop all containers"
-        return f"🐳 Docker: {action}"
-    
-    elif tool_name == "execute_command":
+            desc = f"🐳 Stop container: {path}" if path else "🐳 Stop all containers"
+            return (desc, None)
+        return (f"🐳 Docker: {action}", None)
+
+    if tool_name == "execute_command":
         cmd = tool_input.get("command", "")
         cwd, remainder = _split_cd_prefix(cmd)
 
-        # Improve readability for multiline heredoc snippets (common in debugging).
-        # Example: python - <<'PY' ...
+        # Detect inline Python (heredoc or -c style)
         if re.search(r"^python\s+.*<<\s*['\"]?\w+['\"]?", remainder, flags=re.S):
-            return _with_in_suffix("🐍 Run inline Python", cwd)
+            desc = "🐍 Run inline Python"
+        elif re.match(r"^python\s+-c\s+", remainder):
+            desc = "🐍 Run inline Python"
+        else:
+            desc = f"⚡ Run: {_short(remainder, 60)}"
 
-        display_cmd = remainder[:60] + "..." if len(remainder) > 60 else remainder
-        return _with_in_suffix(f"⚡ Run: {display_cmd}", cwd)
-    
-    elif tool_name == "web_search":
-        query = tool_input.get("query", "")
-        return f"🔍 Search: {query}"
-    
-    elif tool_name == "fetch_webpage":
-        url = tool_input.get("url", "")
-        display_url = url[:50] + "..." if len(url) > 50 else url
-        return f"🌐 Fetch: {display_url}"
-    
-    return f"🔧 {tool_name}"
+        return (desc, cwd)
+
+    if tool_name == "web_search":
+        return (f"🔍 Search: {tool_input.get('query', '')}", None)
+
+    if tool_name == "fetch_webpage":
+        return (f"🌐 Fetch: {_short(tool_input.get('url', ''), 50)}", None)
+
+    return (f"🔧 {tool_name}", None)
 
 
-def _parse_exec_command(cmd):
-    """Parse exec command into human-readable description"""
-    parts = [p.strip() for p in cmd.split('|')]
+def _parse_exec_command(cmd: str) -> str:
+    """Parse a container exec command into a short human-readable description."""
+    parts = [p.strip() for p in cmd.split("|")]
     main_cmd = parts[0]
 
-    # Multiline heredoc snippets (common in debugging)
     if re.search(r"^python(3)?\s+.*<<\s*['\"]?\w+['\"]?", main_cmd, flags=re.S):
         return "🐍 Run inline Python"
-    
+
     # Check for line limiting in pipe
     line_info = ""
     for part in parts[1:]:
-        if match := re.match(r'(head|tail)\s+(?:-n\s*)?(\d+)', part):
+        match = re.match(r"(head|tail)\s+(?:-n\s*)?(\d+)", part)
+        if match:
             line_info = f" ({'first' if match.group(1) == 'head' else 'last'} {match.group(2)} lines)"
-    
+
     # Simple command mappings
-    simple_cmds = {
-        "ls": "📂 List files", "find ": "🔎 Find files",
-        "grep ": "🔎 Search in files", "wc ": "📊 Count lines/words"
-    }
-    for prefix, desc in simple_cmds.items():
+    for prefix, desc in (
+        ("ls", "📂 List files"),
+        ("find ", "🔎 Find files"),
+        ("grep ", "🔎 Search in files"),
+        ("wc ", "📊 Count lines/words"),
+    ):
         if main_cmd.startswith(prefix):
             return desc
-    
+
     # File read/write commands
     if main_cmd.startswith("cat"):
         if ">>" in main_cmd or main_cmd.startswith("cat >"):
-            match = re.search(r'cat\s*>>?\s*([^\s<]+)', main_cmd)
-            filename = match.group(1).split('/')[-1] if match else "file"
+            match = re.search(r"cat\s*>>?\s*([^\s<]+)", main_cmd)
+            filename = match.group(1).split("/")[-1] if match else "file"
             return f"✏️  {'Append to' if '>>' in main_cmd else 'Edit'} {filename}"
-        elif ">" not in main_cmd and (match := re.search(r'cat\s+([^|]+)', main_cmd)):
-            return f"📄 Read {match.group(1).strip().split('/')[-1]}{line_info}"
-    
-    # Head/tail commands
-    for cmd_name, direction in [("head", "first"), ("tail", "last")]:
+        if ">" not in main_cmd:
+            match = re.search(r"cat\s+([^|]+)", main_cmd)
+            if match:
+                return f"📄 Read {match.group(1).strip().split('/')[-1]}{line_info}"
+
+    for cmd_name, direction in (("head", "first"), ("tail", "last")):
         if main_cmd.startswith(f"{cmd_name} "):
-            if match := re.match(rf'{cmd_name}\s+(?:-n\s*)?(-?\d+)?\s*(.+)?', main_cmd):
+            match = re.match(rf"{cmd_name}\s+(?:-n\s*)?(-?\d+)?\s*(.+)?", main_cmd)
+            if match and match.group(2):
                 num, filepath = match.group(1), match.group(2)
-                if filepath:
-                    filename = filepath.strip().split('/')[-1]
-                    suffix = f" ({direction} {num.lstrip('-')} lines)" if num else ""
-                    return f"📄 Read {filename}{suffix}"
+                filename = filepath.strip().split("/")[-1]
+                suffix = f" ({direction} {num.lstrip('-')} lines)" if num else ""
+                return f"📄 Read {filename}{suffix}"
             return "📄 Read file"
 
-    # sed -n line range commands: sed -n '1,200p' /path/to/file
     if main_cmd.startswith("sed "):
-        if match := re.match(r"sed\s+-n\s+['\"]?(\d+),(\d+)p['\"]?\s+(.+)", main_cmd):
+        match = re.match(r"sed\s+-n\s+['\"]?(\d+),(\d+)p['\"]?\s+(.+)", main_cmd)
+        if match:
             start, end, filepath = match.groups()
-            filename = filepath.strip().split('/')[-1]
+            filename = filepath.strip().split("/")[-1]
             return f"📄 Read {filename} (lines {start}-{end})"
 
-    display_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
-    return f"⚡ Run: {display_cmd}"
+    return f"⚡ Run: {_short(cmd, 50)}"
 
 
 class TerminalTool:
-    """Execute shell commands in workspace"""
+    """Execute shell commands in workspace."""
 
-    # Dangerous commands that require user confirmation (from config)
     DANGEROUS_COMMANDS = config.tools.dangerous_commands
 
     def __init__(self, workspace_dir, confirm_callback=None):
@@ -135,10 +144,9 @@ class TerminalTool:
         self.confirm_callback = confirm_callback or self._default_confirm
 
     def _default_confirm(self, command):
-        """Default confirmation prompt"""
         print(f"\n⚠️  DANGEROUS COMMAND DETECTED: {command}")
         response = input("Allow execution? (y/N): ").strip().lower()
-        return response == 'y'
+        return response == "y"
 
     def get_schema(self):
         return {
@@ -147,27 +155,23 @@ class TerminalTool:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute"
-                    }
+                    "command": {"type": "string", "description": "The shell command to execute"}
                 },
-                "required": ["command"]
-            }
+                "required": ["command"],
+            },
         }
 
     def execute(self, command):
-        """Execute command with no timeout"""
-        # Check if command is dangerous and needs confirmation
-        cmd_name = command.split()[0].lower()
-        
-        # Check for dangerous commands (including piped commands)
-        all_parts = command.replace('|', ' ').replace('&&', ' ').replace(';', ' ').split()
+        cmd_name = command.split()[0].lower() if command.split() else ""
+        _ = cmd_name  # keep behavior: previously computed but unused beyond legacy
+
+        all_parts = command.replace("|", " ").replace("&&", " ").replace(";", " ").split()
         dangerous_found = [p for p in all_parts if p.lower() in self.DANGEROUS_COMMANDS]
-        
-        if dangerous_found:
-            if not self.confirm_callback(command):
-                return {"error": f"Command rejected by user. Dangerous commands detected: {dangerous_found}"}
+
+        if dangerous_found and not self.confirm_callback(command):
+            return {
+                "error": f"Command rejected by user. Dangerous commands detected: {dangerous_found}"
+            }
 
         try:
             result = subprocess.run(
@@ -175,20 +179,15 @@ class TerminalTool:
                 shell=True,
                 capture_output=True,
                 cwd=self.workspace_dir,
-                text=True
-                # No timeout parameter
+                text=True,
             )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
+            return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
         except Exception as e:
             return {"error": str(e)}
 
 
 class WebSearchTool:
-    """Search web using ddgs"""
+    """Search web using ddgs."""
 
     def __init__(self):
         self.ddgs = DDGS()
@@ -199,31 +198,27 @@ class WebSearchTool:
             "description": "Search the web using DuckDuckGo. Returns titles, URLs, and snippets. Use for finding documentation, packages, error messages, etc.",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query"
-                    }
-                },
-                "required": ["query"]
-            }
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
         }
 
     def execute(self, query):
-        """Search with configurable max_results"""
         try:
-            results = list(self.ddgs.text(
-                query,
-                region=config.tools.web_search.region,
-                max_results=config.tools.web_search.max_results
-            ))
+            results = list(
+                self.ddgs.text(
+                    query,
+                    region=config.tools.web_search.region,
+                    max_results=config.tools.web_search.max_results,
+                )
+            )
             return {"results": results}
         except Exception as e:
             return {"error": str(e)}
 
 
 class FetchWebTool:
-    """Fetch webpage content"""
+    """Fetch webpage content."""
 
     def get_schema(self):
         return {
@@ -231,57 +226,43 @@ class FetchWebTool:
             "description": "Fetch and extract text content from a URL. Use to read documentation, README files, or error descriptions.",
             "input_schema": {
                 "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to fetch"
-                    }
-                },
-                "required": ["url"]
-            }
+                "properties": {"url": {"type": "string", "description": "URL to fetch"}},
+                "required": ["url"],
+            },
         }
 
     def execute(self, url):
-        """Fetch webpage content"""
         try:
             response = requests.get(url, timeout=config.tools.web_fetch.timeout)
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(response.content, "html.parser")
 
-            # Remove script and style elements
             for script in soup(["script", "style"]):
                 script.decompose()
 
             text = soup.get_text()
-            # Clean up whitespace
             lines = (line.strip() for line in text.splitlines())
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
+            text = "\n".join(chunk for chunk in chunks if chunk)
 
-            # Limit content length from config
-            return {"content": text[:config.tools.web_fetch.content_limit]}
+            return {"content": text[: config.tools.web_fetch.content_limit]}
         except Exception as e:
             return {"error": str(e)}
 
 
 class DockerSandboxTool:
-    """Execute commands in a Docker sandbox for safe exploration of external directories.
-    
-    Uses the agent's ContainerManager for persistent container with multiple mounts.
-    """
+    """Execute commands in a Docker sandbox via the agent's ContainerManager."""
 
     def __init__(self, agent_ref=None, confirm_callback=None):
-        self.agent_ref = agent_ref  # Reference to CodingAgent for container management
+        self.agent_ref = agent_ref
         self.confirm_callback = confirm_callback or self._default_confirm
 
     def set_agent_ref(self, agent):
-        """Set agent reference after initialization"""
         self.agent_ref = agent
 
     def _default_confirm(self, message):
-        """Default confirmation prompt"""
         print(f"\n🐳 {message}")
         response = input("Proceed? (y/N): ").strip().lower()
-        return response == 'y'
+        return response == "y"
 
     def get_schema(self):
         return {
@@ -289,7 +270,7 @@ class DockerSandboxTool:
             "description": """Execute commands in a Docker sandbox. Use this for safely exploring external directories or running untrusted code.
 
 A single container persists for the entire session. All directories are mounted in the same container.
-            
+
 Actions:
 - 'start': Mount a directory and start container if not running. Path is converted to Unix format (D:\\path → /d/path).
 - 'exec': Execute a command inside the container.
@@ -306,69 +287,60 @@ Examples:
                     "action": {
                         "type": "string",
                         "enum": ["start", "exec", "stop"],
-                        "description": "Action to perform: start, exec, or stop"
+                        "description": "Action to perform: start, exec, or stop",
                     },
                     "mount_path": {
                         "type": "string",
-                        "description": "Path to mount into container (required for 'start')"
+                        "description": "Path to mount into container (required for 'start')",
                     },
                     "command": {
                         "type": "string",
-                        "description": "Command to execute in container (required for 'exec' action)"
-                    }
+                        "description": "Command to execute in container (required for 'exec' action",
+                    },
                 },
-                "required": ["action"]
-            }
+                "required": ["action"],
+            },
         }
 
     def execute(self, action, mount_path=None, command=None, **kwargs):
-        """Execute docker sandbox action"""
         if not self.agent_ref:
             return {"error": "DockerSandboxTool not initialized with agent reference"}
 
         if action == "start":
             return self._start_or_add_mount(mount_path)
-        elif action == "exec":
+        if action == "exec":
             return self._exec_command(command)
-        elif action == "stop":
+        if action == "stop":
             return self._stop_container()
-        else:
-            return {"error": f"Unknown action: {action}"}
+        return {"error": f"Unknown action: {action}"}
 
     def _start_or_add_mount(self, mount_path):
-        """Start container or add new mount"""
         if not mount_path:
             return {"error": "mount_path is required for 'start' action"}
 
-        # Use agent's add_working_directory method
         result = self.agent_ref.add_working_directory(mount_path)
-        
+
         if result.get("status") == "already_mounted":
             return {
                 "status": "Already mounted",
                 "mount_path": result["mount_path"],
-                "container": self.agent_ref.container_manager.container_name
-            }
-        elif result.get("error"):
-            return {"error": result["error"]}
-        else:
-            return {
-                "status": result.get("status", "ready"),
-                "mount_path": result["mount_path"],
                 "container": self.agent_ref.container_manager.container_name,
-                "all_mounts": self.agent_ref.container_manager.get_mount_info()
             }
+        if result.get("error"):
+            return {"error": result["error"]}
+        return {
+            "status": result.get("status", "ready"),
+            "mount_path": result["mount_path"],
+            "container": self.agent_ref.container_manager.container_name,
+            "all_mounts": self.agent_ref.container_manager.get_mount_info(),
+        }
 
     def _exec_command(self, command):
-        """Execute command in container"""
         if not command:
             return {"error": "command is required for 'exec' action"}
-
-        cm = self.agent_ref.container_manager
-        return cm.exec(command)
+        return self.agent_ref.container_manager.exec(command)
 
     def _stop_container(self):
-        """Stop the container"""
         cm = self.agent_ref.container_manager
-        result = cm.stop()
+        cm.stop()
         return {"status": "stopped", "container": cm.container_name}

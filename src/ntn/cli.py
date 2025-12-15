@@ -13,7 +13,8 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PromptStyle
 from .config import config, get_color
 from .tools import TerminalTool, WebSearchTool, FetchWebTool, DockerSandboxTool, get_tool_description
-from .agent import CodingAgent, print_divider
+from .agent import CodingAgent
+from .ui import print_divider
 
 # Initialize colorama
 init(autoreset=True)
@@ -206,10 +207,14 @@ def parse_debug_file(filepath):
                     if include_in_messages:
                         messages.append({"role": "assistant", "content": assistant_content})
 
-                    # Extract thinking indicator for display (always)
+                    # Extract thinking indicator and content for display
                     for b in assistant_content:
                         if b.get("type") == "thinking":
                             display_history.append(("thinking", "🧠 Thinking..."))
+                            if config.ui.show_think_content:
+                                thinking_text = b.get('thinking', '')
+                                if thinking_text:
+                                    display_history.append(("thinking", thinking_text))
 
                     # Extract text for display (always)
                     texts = [b["text"] for b in assistant_content if b.get("type") == "text"]
@@ -219,8 +224,10 @@ def parse_debug_file(filepath):
                     # Extract tool descriptions for display (always)
                     for b in assistant_content:
                         if b.get("type") == "tool_use":
-                            desc = get_tool_description(b.get("name", ""), b.get("input", {}))
-                            display_history.append(("tool", desc))
+                            description, path = get_tool_description(b.get("name", ""), b.get("input", {}))
+                            full_desc = f"{description} (In {path})" if path else description
+                            display_history.append(("tool", full_desc))
+
                 except json.JSONDecodeError:
                     pass
 
@@ -292,9 +299,24 @@ def replay_display_history(display_history):
     }
     for role, content in display_history:
         color, prefix = role_formats.get(role, (Style.RESET_ALL, ""))
-        print(f"{color}{prefix + ' ' if prefix else ''}{content}{Style.RESET_ALL}")
-        if role == "user" or role == "assistant":
-            print(); print_divider(); print()
+
+        # Special handling for tool entries with paths
+        if role == "tool" and " (In " in content:
+            # Split into description and path
+            parts = content.rsplit(" (In ", 1)
+            if len(parts) == 2:
+                desc = parts[0]
+                path = parts[1].rstrip(")")
+                tool_color = get_color("tool")
+                path_color = get_color("tool_path")
+                print(f"{tool_color}{desc}{Style.RESET_ALL} {path_color}(In {path}){Style.RESET_ALL}")
+            else:
+                print(f"{color}{prefix + ' ' if prefix else ''}{content}{Style.RESET_ALL}")
+        else:
+            print(f"{color}{prefix + ' ' if prefix else ''}{content}{Style.RESET_ALL}")
+
+        if role == "user":
+            print(); print_divider(config.ui.divider_width); print()
 
 
 def parse_arguments():
@@ -308,15 +330,17 @@ def parse_arguments():
         help='Resume from a debug file. If no file specified, uses the most recent.'
     )
     parser.add_argument(
-        '-t', '--think',
-        action='store_true',
-        help='Enable extended thinking for complex reasoning tasks'
+        '-nt', '--no-think',
+        action='store_false',
+        dest='think',
+        default=True,
+        help='Disable extended thinking (enabled by default)'
     )
     parser.add_argument(
         '-m', '--model',
         choices=['gpt', 'opus', 'sonnet', 'haiku'],
-        default='gpt',
-        help='Model to use: gpt (default), opus, sonnet, or haiku'
+        default='opus',
+        help='Model to use: opus (default), gpt, sonnet, or haiku'
     )
     return parser.parse_args()
 
@@ -369,11 +393,11 @@ def main():
             print(f"{Fore.CYAN}--- Previous conversation ---{Style.RESET_ALL}\n")
             replay_display_history(display_history)
             # Only add divider if replay_display_history didn't already add one
-            # (it adds divider after "user" and "assistant" entries)
+            # (it only adds divider after "user" entries now)
             last_role = display_history[-1][0] if display_history else None
-            if last_role not in ("user", "assistant"):
+            if last_role != "user":
                 print()
-                print_divider()
+                print_divider(config.ui.divider_width)
                 print()
             print(f"{Fore.CYAN}--- Resuming conversation ---{Style.RESET_ALL}\n")
         else:
@@ -427,6 +451,8 @@ def main():
     features = [f"model: {model_display}"]
     if args.think:
         features.append("extended thinking")
+    else:
+        features.append("thinking disabled")
     print(f"{Fore.CYAN}Features: {', '.join(features)}")
     
     print(f"{Fore.CYAN}Shift+Enter for new line | Enter to submit | Ctrl+C to exit")
@@ -434,6 +460,9 @@ def main():
     # If resuming with incomplete turn, continue it first
     if incomplete_turn:
         try:
+            print()
+            print_divider(config.ui.divider_width)
+            print()
             print(f"{Fore.YELLOW}Continuing interrupted turn...{Style.RESET_ALL}")
             agent.continue_incomplete_turn(incomplete_turn)
         except KeyboardInterrupt:
@@ -462,7 +491,7 @@ def main():
                 continue
 
             print()
-            print_divider()
+            print_divider(config.ui.divider_width)
             print()
 
             try:
