@@ -4,13 +4,15 @@ A minimal AI agent that helps with coding tasks in a workspace. Supports multipl
 
 ## Features
 
-- **Multi-provider support**: GPT-5.2 (default), Claude Opus/Sonnet/Haiku
+- **Multi-provider support**: Claude Opus (default), GPT-5.2, Sonnet, Haiku
 - **Docker-first file operations**: All file operations run in a Docker container with Unix tools
 - **Web search**: Search using DuckDuckGo (ddgs package)
 - **Web fetching**: Fetch and read webpage content
 - **Terminal execution**: Run Windows commands when needed
 - **Persistent container**: Single container per session, auto-starts on launch
 - **Command denylist**: Dangerous commands require user confirmation
+- **Two-color tool display**: Tool descriptions in yellow, paths in cyan for better readability
+- **Smart command detection**: Recognizes common patterns (python -c, inline scripts) for better descriptions
 - **Colored output**: Easy-to-read console with color-coded messages
 - **Debug logging**: Incremental logging to `debug/` folder (crash-resilient)
 - **Resume sessions**: Continue previous conversations with `-r` flag
@@ -19,10 +21,10 @@ A minimal AI agent that helps with coding tasks in a workspace. Supports multipl
 - **Auto-cleanup**: Empty conversations (no user messages) are automatically deleted
 - **Rate limit handling**: Automatically waits and retries using `retry-after` header
 - **Prompt caching**: System prompt and tools are cached to reduce costs
-- **Model selection**: Choose between GPT and Claude models with `-m` flag
+- **Model selection**: Choose between Claude and GPT models with `-m` flag
 - **Streaming output**: Real-time response display (always enabled)
 - **Cost tracking**: Shows per-request and session costs with token usage
-- **Extended thinking**: Enable deep reasoning for complex tasks with `-t` flag
+- **Extended thinking**: Deep reasoning enabled by default, disable with `-nt` flag
 
 ## Installation
 
@@ -42,14 +44,14 @@ pip install -e .
 
 Set your API key based on the model you want to use:
 
-**For GPT-5.2 (default):**
-```bash
-export OPENAI_API_KEY='your-api-key-here'
-```
-
-**For Claude models:**
+**For Claude models (default):**
 ```bash
 export ANTHROPIC_API_KEY='your-api-key-here'
+```
+
+**For GPT-5.2:**
+```bash
+export OPENAI_API_KEY='your-api-key-here'
 ```
 
 (Optional) Install Docker for sandbox functionality.
@@ -70,23 +72,23 @@ ntn -r
 ntn -r debug/debug_20251210_120000.txt
 ```
 
-Enable extended thinking (better for complex reasoning):
+Disable extended thinking (enabled by default):
 ```bash
-ntn -t
+ntn -nt
 ```
 
 Use a different model:
 ```bash
-ntn -m gpt     # Use GPT-5.2 (default)
-ntn -m opus    # Use Claude Opus 4.5
+ntn -m opus    # Use Claude Opus 4.5 (default)
 ntn -m sonnet  # Use Claude Sonnet 4.5
 ntn -m haiku   # Use Claude Haiku 4.5
+ntn -m gpt     # Use GPT-5.2
 ```
 
 Combine flags:
 ```bash
-ntn -t -r           # Resume with extended thinking
-ntn -m opus -t      # Opus with extended thinking
+ntn -nt -r          # Resume without extended thinking
+ntn -m gpt -nt      # GPT without extended thinking
 ```
 
 Alternative: Run as Python module:
@@ -203,10 +205,21 @@ Each block is written immediately, so even if the agent crashes, the debug file 
 
 The agent uses colored output for readability:
 - 🟢 **Green**: Agent messages
-- 🟡 **Yellow**: Tool operations (📂 List files, 📄 Read file, ✏️ Edit file, 🐳 Docker, etc.)
-- 🟣 **Magenta**: Thinking indicator (when extended thinking enabled)
-- 🔵 **Cyan**: System messages, user prompts
+- 🟡 **Yellow**: Tool descriptions (📂 List files, 📄 Read file, ✏️ Edit file, 🐳 Docker, etc.)
+- 🔵 **Cyan**: Working directory paths `(In /path/to/dir)`, system messages, user prompts
+- 🟣 **Magenta**: Thinking indicator (extended thinking enabled by default)
 - 🔴 **Red**: Errors
+
+**Tool Display Example:**
+```
+🐍 Run inline Python (In /d/downloads/coding-agent)
+    ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    Yellow           Cyan
+```
+
+Smart command detection automatically shows meaningful descriptions:
+- `python -c "..."` → "🐍 Run inline Python"
+- Long commands are truncated for readability
 
 Full JSON input/output is logged to `debug/debug_<timestamp>.txt` for debugging.
 

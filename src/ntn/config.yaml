@@ -68,7 +68,7 @@ ui:
     assistant: GREEN
     thinking: MAGENTA
     tool: YELLOW
-    tool_path: CYAN
+    tool_path: CYAN  # Color for "(In /path)" directory display in tool output
     error: RED
     warning: YELLOW
     system: CYAN
