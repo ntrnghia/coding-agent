@@ -45,6 +45,9 @@ class StreamAccumulator:
 
         if et == "text_start":
             if self.print_text:
+                # Add blank line after thinking content if thinking was shown
+                if self._thinking_shown:
+                    print("\n")
                 print(
                     f"{self.get_assistant_color('assistant')}{self.assistant_prefix} ",
                     end="",
